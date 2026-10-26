@@ -5,7 +5,6 @@
         "name": "default",
         "compatibleSdkVersion": "26.0.0",
         "targetSdkVersion": "26.0.0",
-        "signingConfig": "default",
         "runtimeOS": "HarmonyOS",
         "buildOption": {
           "strictMode": {
@@ -23,21 +22,6 @@
         "name": "release"
       }
     ],
-    "signingConfigs": [
-      {
-        "name": "default",
-        "type": "HarmonyOS",
-        "material": {
-          "certpath": "/Users/bobli/.ohos/config/default_veil_7T-BagHgk_ePr4iVIfm56WDN87ypyR2cuUeA-SPPBKo=.cer",
-          "keyAlias": "debugKey",
-          "keyPassword": "0000001B3DAAB0772554D49926B59F7FA9C94B550561030160734D2C3C40982B124169106EDF6D02E2F370",
-          "profile": "/Users/bobli/.ohos/config/default_veil_7T-BagHgk_ePr4iVIfm56WDN87ypyR2cuUeA-SPPBKo=.p7b",
-          "signAlg": "SHA256withECDSA",
-          "storeFile": "/Users/bobli/.ohos/config/default_veil_7T-BagHgk_ePr4iVIfm56WDN87ypyR2cuUeA-SPPBKo=.p12",
-          "storePassword": "0000001BD37EDF06EAA64FA3808970BCE44864C1444C2E4128996C47A46A9356C2C224A526FCD3CF1DB547"
-        }
-      }
-    ]
   },
   "modules": [
     {

@@ -1,9 +1,9 @@
 {
   "string": [
-    { "name": "module_desc", "value": "Veil proxy client" },
-    { "name": "EntryAbility_desc", "value": "Veil" },
-    { "name": "EntryAbility_label", "value": "Veil" },
-    { "name": "card_display_name", "value": "Veil 连接" },
+    { "name": "module_desc", "value": "Kitsune proxy client" },
+    { "name": "EntryAbility_desc", "value": "Kitsune" },
+    { "name": "EntryAbility_label", "value": "Kitsune" },
+    { "name": "card_display_name", "value": "Kitsune 连接" },
     { "name": "card_description", "value": "查看连接状态与流量，一键连接或断开" }
   ]
 }

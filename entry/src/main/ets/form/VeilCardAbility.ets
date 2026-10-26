@@ -248,7 +248,7 @@ export default class VeilCardAbility extends FormExtensionAbility {
       lastStartMs = now;
       hilog.info(0x00FF, TAG, 'core down, starting VPN extension from card');
       try {
-        const want: Want = { bundleName: 'org.bobli.veil', abilityName: 'VeilVpnAbility' };
+        const want: Want = { bundleName: 'com.nolanho.kitsune', abilityName: 'VeilVpnAbility' };
         await vpnExtension.startVpnExtensionAbility(want);
       } catch (err) {
         hilog.warn(0x00FF, TAG, 'startVpnExtensionAbility: %{public}s', String(err));

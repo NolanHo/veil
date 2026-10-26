@@ -56,7 +56,7 @@ export class CoreClient {
 
   private rpc: LocalRpc = new LocalRpc();
   private filesDir: string = '';
-  private bundleName: string = 'org.bobli.veil';
+  private bundleName: string = 'com.nolanho.kitsune';
   private state: CoreState = CoreState.Idle;
   private lastError: string = '';
   private bootInFlight: Promise<boolean> | null = null;

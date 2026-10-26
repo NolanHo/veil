@@ -74,7 +74,7 @@ func main() {
 			cancel()
 			continue
 		}
-		fmt.Printf("[%s] tls handshake ok in %s (%s)\n", target, time.Since(hstart), tc.ConnectionState().Version)
+		fmt.Printf("[%s] tls handshake ok in %s (0x%04x)\n", target, time.Since(hstart), tc.ConnectionState().Version)
 		_ = tc.SetDeadline(time.Now().Add(15 * time.Second))
 		_, _ = tc.Write([]byte("GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n"))
 		total := 0

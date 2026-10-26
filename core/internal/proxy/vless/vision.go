@@ -268,6 +268,10 @@ func (w *visionWriter) filter(b []byte) {
 	}
 }
 
+// downlinkFilterEnabled restores the disabled XtlsFilterTls downlink filter.
+// It stays false: see the comment on filterRead.
+const downlinkFilterEnabled = false
+
 // filterRead is the downlink half of XtlsFilterTls: it watches the ServerHello
 // to learn whether the inner connection is TLS 1.3 (what Vision exists for) and
 // ends padding early for everything else.
@@ -276,7 +280,13 @@ func (w *visionWriter) filterRead(b []byte, st *visionState) {
 	// path, and it is what made "plain HTTP through the proxy works, every
 	// HTTPS request times out". Vision only needs the padding framing; the
 	// splice optimisation it enables is not worth corrupting TLS.
-	return
+	//
+	// Kept behind a constant instead of a bare `return` so `go vet` does not
+	// report the disabled body as unreachable code; flipping the constant is
+	// the whole of the revert.
+	if !downlinkFilterEnabled {
+		return
+	}
 	st.wmu.Lock()
 	defer st.wmu.Unlock()
 	if st.remainServerHello > 0 {

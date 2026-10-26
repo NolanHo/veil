@@ -1,10 +1,10 @@
 {
   "modelVersion": "26.0.0",
-  "name": "veil",
+  "name": "kitsune",
   "version": "1.0.0",
   "description": "Veil — a modern proxy client for HarmonyOS NEXT",
   "main": "",
-  "author": "bobli",
+  "author": "nolanho",
   "license": "MIT",
   "dependencies": {},
   "devDependencies": {}
