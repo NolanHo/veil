@@ -340,3 +340,25 @@ func TestNeedsIP(t *testing.T) {
 		})
 	}
 }
+
+// TestGeoIPCNCoversDomesticAllocations pins the generated APNIC snapshot: a
+// domestic site that resolves to an unlisted range used to travel through the
+// proxy, which is the most visible way this client differed from Clash.
+func TestGeoIPCNCoversDomesticAllocations(t *testing.T) {
+	m, err := New([]config.Rule{{Type: "geoip", Value: "cn", Action: "direct"}}, "rule", "direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cn := []string{"58.222.20.36", "14.215.182.140", "182.61.201.163", "114.114.114.114", "223.5.5.5"}
+	for _, s := range cn {
+		if got := m.Match(Meta{Dst: netip.MustParseAddr(s)}); got.Rule != "geoip:cn" {
+			t.Errorf("%s = %q, want geoip:cn (mainland allocation missing from the table)", s, got.Rule)
+		}
+	}
+	notCN := []string{"8.8.8.8", "1.1.1.1", "93.184.216.34", "103.235.46.96"}
+	for _, s := range notCN {
+		if got := m.Match(Meta{Dst: netip.MustParseAddr(s)}); got.Rule == "geoip:cn" {
+			t.Errorf("%s matched geoip:cn, want no match", s)
+		}
+	}
+}

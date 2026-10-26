@@ -27,11 +27,13 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 
 	// A fake address stands for a domain. Recover the name so domain rules can
 	// see it and so the outbound dials by hostname.
+	fromFake := false
 	if host == "" && ip.IsValid() && resolver != nil && resolver.IsFake(ip) {
 		if name, ok := resolver.HostFor(ip); ok {
 			host = name
 			ip = netip.Addr{}
 			target = net.JoinHostPort(name, fmt.Sprint(port))
+			fromFake = true
 		}
 	}
 
@@ -77,6 +79,14 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 	}
 	if ob == nil {
 		return nil, action, target, fmt.Errorf("no outbound available")
+	}
+	// A fake address only exists inside our own DNS: any outbound that dials
+	// locally would hand it to the system resolver, get a fake answer back and
+	// connect to nothing (on device that shows up as "connected, this site does
+	// not load"). Dial the address the routing lookup produced instead. Proxied
+	// outbounds keep the name so the exit node stays the authority for DNS.
+	if fromFake && meta.Dst.IsValid() && ob.Tag() == "direct" {
+		target = netip.AddrPortFrom(meta.Dst.Unmap(), port).String()
 	}
 	return ob, action, target, nil
 }

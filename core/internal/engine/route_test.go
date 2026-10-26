@@ -181,12 +181,35 @@ func TestRouteFakeIPGeoIPCN(t *testing.T) {
 	if action.Rule != "geoip:cn" || ob.Tag() != "direct" {
 		t.Fatalf("fake-ip geoip route = %s/%q, want DIRECT/geoip:cn", ob.Tag(), action.Rule)
 	}
-	// The outbound still receives the name: the exit node does the real lookup.
-	if want := cnName + ":443"; target != want {
-		t.Fatalf("target = %q, want %q", target, want)
+	// A direct dial must use the address the router resolved: handing the name
+	// to the local resolver would get the fake address back and connect nowhere.
+	if want := cnAddr.String() + ":443"; target != want {
+		t.Fatalf("direct target = %q, want the resolved address %q", target, want)
 	}
 	if got := up.aCount.Load(); got != 1 {
 		t.Fatalf("A queries = %d, want 1", got)
+	}
+}
+
+// A proxied outbound keeps the hostname: the exit node is the authority for
+// DNS, and a name it resolves itself is the whole point of remote resolution.
+func TestRouteFakeIPProxyKeepsHostname(t *testing.T) {
+	up := newTestDNS(t, cnAddr)
+	res := newTestResolver(t, up.addr())
+	eng := newRouteEngine(t, []config.Rule{
+		{Type: "ip-cidr", Value: cnAddr.String() + "/32", Action: "proxy"},
+		{Type: "final", Action: "direct"},
+	}, res)
+
+	ob, action, target, err := eng.route(context.Background(), "tcp", fakeTarget(t, res, cnName))
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if ob.Tag() != "proxy" || action.Rule != "ip-cidr:"+cnAddr.String()+"/32" {
+		t.Fatalf("route = %s/%q, want proxy/ip-cidr", ob.Tag(), action.Rule)
+	}
+	if want := cnName + ":443"; target != want {
+		t.Fatalf("proxy target = %q, want the hostname %q", target, want)
 	}
 }
 
