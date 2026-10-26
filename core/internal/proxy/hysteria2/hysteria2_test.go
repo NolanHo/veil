@@ -1,20 +1,25 @@
 package hysteria2
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/netip"
-
+	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,6 +28,7 @@ import (
 	"golang.org/x/net/http2/hpack"
 
 	"veil/internal/config"
+	"veil/internal/transport"
 )
 
 // ---------------------------------------------------------------------------
@@ -44,7 +50,29 @@ type testServer struct {
 
 func newTestServer(t *testing.T, password string) *testServer {
 	t.Helper()
-	cert := selfSignedCert(t)
+	return newTestServerWith(t, password, selfSignedCert(t), nil)
+}
+
+// newTestServerWithCert is newTestServer with a caller-supplied certificate, so
+// a test can pin that exact certificate's digest.
+func newTestServerWithCert(t *testing.T, password string, cert tls.Certificate) *testServer {
+	t.Helper()
+	return newTestServerWith(t, password, cert, nil)
+}
+
+// newTestServerObfs runs the server behind salamander obfuscation, so a client
+// only completes the QUIC handshake if its obfs implementation matches.
+func newTestServerObfs(t *testing.T, password, obfsPassword string) *testServer {
+	t.Helper()
+	obfs, err := newSalamander(obfsPassword)
+	if err != nil {
+		t.Fatalf("newSalamander: %v", err)
+	}
+	return newTestServerWith(t, password, selfSignedCert(t), obfs)
+}
+
+func newTestServerWith(t *testing.T, password string, cert tls.Certificate, obfs *salamander) *testServer {
+	t.Helper()
 	tlsConf := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{alpnH3},
@@ -54,14 +82,21 @@ func newTestServer(t *testing.T, password string) *testServer {
 	if err != nil {
 		t.Fatalf("listen udp: %v", err)
 	}
-	ln, err := quic.Listen(pkt, tlsConf, &quic.Config{EnableDatagrams: true})
+	var conn net.PacketConn = pkt
+	if obfs != nil {
+		conn = newSalamanderConn(pkt, obfs)
+	}
+	ln, err := quic.Listen(conn, tlsConf, &quic.Config{EnableDatagrams: true})
 	if err != nil {
-		_ = pkt.Close()
+		_ = conn.Close()
 		t.Fatalf("quic listen: %v", err)
 	}
 	s := &testServer{t: t, ln: ln, addr: ln.Addr().String(), password: password}
 	go s.acceptLoop()
-	t.Cleanup(func() { _ = ln.Close() })
+	t.Cleanup(func() {
+		_ = ln.Close()
+		_ = conn.Close()
+	})
 	return s
 }
 
@@ -148,6 +183,15 @@ func (s *testServer) handleAuthRequest(stream *quic.Stream) {
 	if err != nil {
 		s.t.Logf("test server: decode request headers: %v", err)
 		return
+	}
+	// A real HTTP/3 server answers an uppercase field name with
+	// H3_MESSAGE_ERROR (0x10e), so this server rejects one too: left to itself
+	// the suite would keep passing a wire format no server accepts.
+	for _, f := range fields {
+		if f.name != strings.ToLower(f.name) {
+			s.t.Errorf("test server: client sent the field name %q; HTTP/3 requires lowercase names", f.name)
+			return
+		}
 	}
 	var status int
 	if headerValue(fields, ":path") == authPath && headerValue(fields, headerAuth) == s.password {
@@ -332,6 +376,205 @@ func TestConnectionReuse(t *testing.T) {
 	if n := srv.auths.Load(); n != 1 {
 		t.Fatalf("expected a single auth, got %d", n)
 	}
+}
+
+func TestQUICSocketIsProtected(t *testing.T) {
+	srv := newTestServer(t, "pw")
+
+	// Record every descriptor the client hands to the protector. On HarmonyOS
+	// this call is what keeps the QUIC socket off our own tun, so it must happen
+	// for the socket the client actually sends from.
+	var mu sync.Mutex
+	var protected []uintptr
+	transport.SetProtector(func(fd uintptr) error {
+		mu.Lock()
+		protected = append(protected, fd)
+		mu.Unlock()
+		return nil
+	})
+	t.Cleanup(func() { transport.SetProtector(nil) })
+
+	client, err := New(serverNode(t, srv, "pw"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp", "example.com:443")
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	client.mu.Lock()
+	pkt := client.pktConn
+	client.mu.Unlock()
+	if pkt == nil {
+		t.Fatal("client has no underlay socket")
+	}
+	sc, ok := pkt.(syscall.Conn)
+	if !ok {
+		t.Fatalf("underlay socket %T exposes no syscall handle", pkt)
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		t.Fatalf("SyscallConn: %v", err)
+	}
+	var want uintptr
+	if err := rc.Control(func(fd uintptr) { want = fd }); err != nil {
+		t.Fatalf("Control: %v", err)
+	}
+	if want == 0 {
+		t.Fatal("underlay socket reported fd 0")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(protected) == 0 {
+		t.Fatal("protector was never called: the QUIC socket bypasses transport")
+	}
+	for _, fd := range protected {
+		if fd == 0 {
+			t.Fatalf("protector called with fd 0 (all calls: %v)", protected)
+		}
+	}
+	for _, fd := range protected {
+		if fd == want {
+			return
+		}
+	}
+	t.Fatalf("protector saw fds %v, none of them the QUIC socket fd %d", protected, want)
+}
+
+// TestCertPinAcceptsMatchingFingerprint covers the self-signed-plus-pin node
+// shape (skip-cert-verify=false, fingerprint set): the digest is the only thing
+// that can validate the server, and both spellings — openssl-style colon-hex
+// with upper case, and bare lower case — must be accepted.
+func TestCertPinAcceptsMatchingFingerprint(t *testing.T) {
+	cert := selfSignedCert(t)
+	srv := newTestServerWithCert(t, "pw", cert)
+	sum := sha256.Sum256(cert.Certificate[0])
+
+	for _, tc := range []struct{ name, pin string }{
+		{"colon upper", colonHex(sum[:])},
+		{"colon lower", strings.ToLower(colonHex(sum[:]))},
+		{"bare lower", hex.EncodeToString(sum[:])},
+		{"bare upper", strings.ToUpper(hex.EncodeToString(sum[:]))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := serverNode(t, srv, "pw")
+			node.TLS.Insecure = false
+			node.TLS.Fingerprint = tc.pin
+			client, err := New(node)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer client.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			conn, err := client.DialContext(ctx, "tcp", "example.com:443")
+			if err != nil {
+				t.Fatalf("DialContext with pinned certificate: %v", err)
+			}
+			defer conn.Close()
+			if _, err := conn.Write([]byte("ping")); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if _, err := io.ReadFull(conn, make([]byte, 4)); err != nil {
+				t.Fatalf("read echo: %v", err)
+			}
+		})
+	}
+}
+
+func TestCertPinRejectsWrongFingerprint(t *testing.T) {
+	cert := selfSignedCert(t)
+	srv := newTestServerWithCert(t, "pw", cert)
+	sum := sha256.Sum256(cert.Certificate[0])
+	wrong := sum
+	wrong[0] ^= 0xff
+
+	node := serverNode(t, srv, "pw")
+	node.TLS.Insecure = false
+	node.TLS.Fingerprint = colonHex(wrong[:])
+	client, err := New(node)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := client.DialContext(ctx, "tcp", "example.com:443"); err == nil {
+		t.Fatal("a mismatched certificate fingerprint was accepted")
+	} else if !strings.Contains(err.Error(), "fingerprint mismatch") {
+		t.Fatalf("expected a fingerprint mismatch, got %v", err)
+	}
+	if n := srv.auths.Load(); n != 0 {
+		t.Fatalf("server authenticated %d connections, want 0", n)
+	}
+}
+
+func TestCertPinParsing(t *testing.T) {
+	valid := make([]byte, sha256.Size)
+	for i := range valid {
+		valid[i] = byte(i)
+	}
+	for _, tc := range []struct {
+		name    string
+		in      string
+		wantPin bool
+		wantErr bool
+	}{
+		{"empty", "", false, false},
+		{"utls name", "chrome", false, false},
+		{"utls name upper", "CHROME", false, false},
+		{"utls name with digits", "randomized", false, false},
+		// A value that is neither a legal digest nor a profile name transport
+		// knows is a malformed pin, not "no pin": guessing the latter silently
+		// drops the certificate constraint.
+		{"malformed trailing letter", strings.Repeat("0", 63) + "g", false, true},
+		{"malformed colon octet", colonHex(valid[:31]) + ":zz", false, true},
+		{"unknown profile name", "chromium", false, true},
+		{"hpkp spelling", "sha256/" + hex.EncodeToString(valid), false, true},
+		{"colon upper", colonHex(valid), true, false},
+		{"bare lower", hex.EncodeToString(valid), true, false},
+		{"spaced upper", "DE 5D FC", false, true},
+		{"truncated", colonHex(valid[:16]), false, true},
+		{"odd digits", hex.EncodeToString(valid)[:63], false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pin, err := certPin(tc.in)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("certPin(%q) err = %v, wantErr %v", tc.in, err, tc.wantErr)
+			}
+			if tc.wantPin != (pin != nil) {
+				t.Fatalf("certPin(%q) = %x, want pin %v", tc.in, pin, tc.wantPin)
+			}
+			if pin != nil && !bytes.Equal(pin, valid) {
+				t.Fatalf("certPin(%q) = %x, want %x", tc.in, pin, valid)
+			}
+		})
+	}
+}
+
+// colonHex renders a digest the way openssl / Clash print a certificate
+// fingerprint: upper-case bytes separated by colons.
+func colonHex(b []byte) string {
+	parts := make([]string, len(b))
+	for i, c := range b {
+		parts[i] = fmt.Sprintf("%02X", c)
+	}
+	return strings.Join(parts, ":")
 }
 
 func TestAuthFailure(t *testing.T) {
@@ -534,15 +777,16 @@ func TestNormalizeAddr(t *testing.T) {
 }
 
 // TestQPackFieldSection pins the encoder/decoder agreement and checks the
-// documented byte layout for a static-table match and a literal header.
+// documented byte layout: the Encoded Field Section Prefix, a static-table match
+// and a literal header.
 func TestQPackFieldSection(t *testing.T) {
 	fields := []headerField{
 		{":method", "POST"},
 		{":scheme", "https"},
 		{":authority", "hysteria"},
 		{":path", "/auth"},
-		{headerAuth, "pw"},
-		{headerCCRX, "0"},
+		{"hysteria-auth", "pw"},
+		{"hysteria-cc-rx", "0"},
 	}
 	block := encodeFieldSection(fields)
 	got, err := decodeFieldSection(block)
@@ -557,13 +801,112 @@ func TestQPackFieldSection(t *testing.T) {
 			t.Fatalf("field %d = %+v, want %+v", i, got[i], fields[i])
 		}
 	}
+	// RFC 9204 §4.5.1: Encoded Field Section Prefix, Required Insert Count = 0
+	// and Delta Base = 0.
+	if !bytes.HasPrefix(block, []byte{0x00, 0x00}) {
+		t.Fatalf("expected the 00 00 field section prefix, got %x", block)
+	}
 	// ":method: POST" is static entry 20, so it is one indexed field line.
-	if block[0] != 0xD4 {
-		t.Fatalf("expected indexed field line 0xD4, got %#x", block[0])
+	if block[2] != 0xD4 {
+		t.Fatalf("expected indexed field line 0xD4, got %#x", block[2])
 	}
 	// ":authority" is static entry 0: name reference with a literal value.
-	if block[2] != 0x50 {
-		t.Fatalf("expected name reference 0x50, got %#x", block[2])
+	if block[4] != 0x50 {
+		t.Fatalf("expected name reference 0x50, got %#x", block[4])
+	}
+}
+
+// TestEncodeFieldSectionPrefix pins the wire prefix a real server required:
+// without it the server read our first field line as the prefix and answered
+// QPACK_DECOMPRESSION_FAILED (0x200), so every auth request failed.
+func TestEncodeFieldSectionPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fields []headerField
+	}{
+		{"empty", nil},
+		{"static match", []headerField{{":method", "POST"}}},
+		{"literal", []headerField{{"hysteria-auth", "pw"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			block := encodeFieldSection(tc.fields)
+			if !bytes.HasPrefix(block, []byte{0x00, 0x00}) {
+				t.Fatalf("encodeFieldSection(%v) = %x, want the 00 00 Encoded Field Section Prefix", tc.fields, block)
+			}
+			if _, err := decodeFieldSection(block); err != nil {
+				t.Fatalf("round trip: %v", err)
+			}
+		})
+	}
+}
+
+// TestEncodeFieldSectionLowercasesNames pins the other wire rule a real server
+// enforces: HTTP/3 field names are lowercase, an uppercase one is rejected with
+// H3_MESSAGE_ERROR (0x10e). The package's constants keep hysteria's canonical
+// spelling, so the encoder normalises before the static-table lookup.
+func TestEncodeFieldSectionLowercasesNames(t *testing.T) {
+	block := encodeFieldSection([]headerField{
+		{":Method", "POST"},
+		{"Hysteria-Auth", "pw"},
+		{"Hysteria-Padding", "xxxxxxxx"},
+	})
+	// The literal name is written as-is, so it must be lowercase on the wire.
+	if !bytes.Contains(block, []byte("hysteria-auth")) || bytes.Contains(block, []byte("Hysteria")) {
+		t.Fatalf("literal field name was not lowercased: %x", block)
+	}
+	got, err := decodeFieldSection(block)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := []headerField{
+		{":method", "POST"},
+		{"hysteria-auth", "pw"},
+		{"hysteria-padding", "xxxxxxxx"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("field count %d, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("field %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestDecodeFieldSectionConsumesPrefix pins the decode side: a real server's
+// response also starts with the Encoded Field Section Prefix, and treating that
+// 0x00 as a field line produced "unsupported qpack representation 0x00".
+func TestDecodeFieldSectionConsumesPrefix(t *testing.T) {
+	// 00 00 = prefix, 0xD4 = indexed static entry 20 (":method: POST").
+	got, err := decodeFieldSection([]byte{0x00, 0x00, 0xD4})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 1 || got[0] != (headerField{":method", "POST"}) {
+		t.Fatalf("decoded %+v, want :method POST", got)
+	}
+	// Field lines without the prefix are not a valid section any more: 0xD4 read
+	// as Required Insert Count is nonzero and is rejected.
+	if _, err := decodeFieldSection([]byte{0xD4}); err == nil {
+		t.Fatal("a field section without the Encoded Field Section Prefix was accepted")
+	}
+	// Required Insert Count != 0 means dynamic-table entries, which we never
+	// announced (SETTINGS carries a capacity of 0).
+	_, err = decodeFieldSection([]byte{0x01, 0x00, 0xD4})
+	if err == nil || !strings.Contains(err.Error(), "required insert count") {
+		t.Fatalf("nonzero Required Insert Count: err = %v, want a required-insert-count error", err)
+	}
+}
+
+// TestHeaderValueIsCaseInsensitive pins the lookup of server headers: the wire
+// spells them lowercase, the package keeps hysteria's canonical spelling.
+func TestHeaderValueIsCaseInsensitive(t *testing.T) {
+	fields := []headerField{{name: "hysteria-udp", value: "false"}}
+	if got := headerValue(fields, headerUDPEnabled); got != "false" {
+		t.Fatalf("headerValue(%q, %q) = %q, want \"false\"", headerUDPEnabled, "hysteria-udp", got)
+	}
+	if got := headerValue(fields, ":status"); got != "" {
+		t.Fatalf("headerValue(:status) = %q, want \"\"", got)
 	}
 }
 
@@ -571,7 +914,7 @@ func TestHuffmanValueDecoding(t *testing.T) {
 	// ":status: 233" encoded as a literal with a Huffman-coded value. The bytes
 	// come from x/net/http2/hpack's encoder so the decoder is exercised against
 	// an independent implementation.
-	var buf []byte
+	buf := []byte{0x00, 0x00}              // Encoded Field Section Prefix: no dynamic table
 	buf = appendQPACKInt(buf, 25, 4, 0x50) // :status (static 25 = ":status 200")
 	dst := hpack.AppendHuffmanString(nil, "233")
 	buf = appendQPACKInt(buf, uint64(len(dst)), 7, 0x80)

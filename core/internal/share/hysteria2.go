@@ -45,6 +45,15 @@ func parseHysteria2(body, raw string) (config.Node, error) {
 		t.ServerName = server
 	}
 	t.Insecure = truthy(qget(q, "insecure", "allowInsecure", "skipVerify"))
+	// pinSHA256 is the certificate pin (mihomo's spelling for a hysteria2 link).
+	// It is the only thing authenticating a self-signed peer, so a value that is
+	// not a digest shape is a malformed link to report, never something to drop.
+	if pin := qget(q, "pinSHA256", "pin-sha256", "pin_sha256"); pin != "" {
+		if !certPinShape(pin) {
+			return config.Node{}, fmt.Errorf("share: hysteria2: pinSHA256 %q is not a certificate digest", pin)
+		}
+		t.Fingerprint = pin
+	}
 
 	if obfs := qget(q, "obfs"); obfs != "" && !strings.EqualFold(obfs, "none") {
 		n.Transport = &config.Transport{

@@ -1,20 +1,28 @@
 package hysteria2
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
 
 	"veil/internal/config"
 	"veil/internal/outbound"
+	"veil/internal/transport"
 )
 
 const (
@@ -46,6 +54,10 @@ type Client struct {
 	tlsConfig  *tls.Config
 	quicConfig *quic.Config
 
+	// obfs is the salamander obfuscator the node asks for, nil when the server
+	// sends plain QUIC.
+	obfs *salamander
+
 	mu      sync.Mutex
 	dialMu  sync.Mutex // serialises handshakes so only one runs at a time
 	conn    *quic.Conn
@@ -68,24 +80,34 @@ var (
 
 // New builds a Hysteria2 client for n.
 //
-// Obfuscation is not supported: config.Node has no obfs field, and while
-// Hysteria2 deployments may use salamander, guessing the password from Remark
-// would be worse than refusing. Nodes with obfs enabled will not work.
+// Salamander obfuscation is supported: share/hysteria2.go and the Clash importer
+// keep "obfs"/"obfs-password" in Transport.Headers (config.Node has no dedicated
+// obfs field), and both must match the server exactly or the QUIC handshake
+// never completes.
 func New(n config.Node) (*Client, error) {
 	if n.Password == "" {
 		return nil, fmt.Errorf("hysteria2 %s: missing password", n.Tag)
+	}
+	tlsConfig, err := buildTLSConfig(n)
+	if err != nil {
+		return nil, err
+	}
+	obfs, err := obfsFromNode(n)
+	if err != nil {
+		return nil, fmt.Errorf("hysteria2 %s: %w", n.Tag, err)
 	}
 	return &Client{
 		tag:        n.Tag,
 		serverAddr: n.Addr(),
 		password:   n.Password,
-		tlsConfig:  buildTLSConfig(n),
+		tlsConfig:  tlsConfig,
+		obfs:       obfs,
 		quicConfig: buildQUICConfig(),
 		sessions:   make(map[*packetConn]struct{}),
 	}, nil
 }
 
-func buildTLSConfig(n config.Node) *tls.Config {
+func buildTLSConfig(n config.Node) (*tls.Config, error) {
 	// Hysteria2 mandates QUIC + TLS 1.3 with ALPN "h3"; the certificate is
 	// usually self-signed, hence the insecure flag.
 	cfg := &tls.Config{
@@ -105,8 +127,100 @@ func buildTLSConfig(n config.Node) *tls.Config {
 				cfg.NextProtos = append(cfg.NextProtos, p)
 			}
 		}
+		pin, err := certPin(n.TLS.Fingerprint)
+		if err != nil {
+			return nil, fmt.Errorf("hysteria2 %s: %w", n.Tag, err)
+		}
+		if pin != nil {
+			// A pinned digest replaces the CA chain, so chain verification has
+			// to step aside for it: with skip-cert-verify=false a self-signed
+			// server would otherwise be rejected before the pin is looked at.
+			cfg.InsecureSkipVerify = true
+			cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+				if len(rawCerts) == 0 {
+					return errors.New("hysteria2: server presented no certificate")
+				}
+				got := sha256.Sum256(rawCerts[0])
+				if !bytes.Equal(got[:], pin) {
+					return fmt.Errorf("hysteria2: certificate fingerprint mismatch: got %x want %x", got, pin)
+				}
+				return nil
+			}
+		}
 	}
-	return cfg
+	return cfg, nil
+}
+
+// utlsFingerprintNames lists the tls.fingerprint values that name a uTLS
+// profile instead of pinning a certificate: exactly the spellings
+// transport.fingerprintIDs accepts (internal/transport/tls.go). Keep the two
+// lists in sync — that resolver is unexported and transport must not grow an
+// export just for this package, so the canonical names come from transport's
+// constants and the remaining utls spellings are written out here.
+//
+// This is a whitelist, not a shape test. "Contains a non-hex character" is no
+// evidence that the user meant a profile name; guessing that is what let a
+// one-character typo in a digest drop the certificate constraint entirely.
+var utlsFingerprintNames = []string{
+	transport.FingerprintChrome, "hellochrome",
+	transport.FingerprintFirefox, "hellofirefox",
+	transport.FingerprintSafari, "hellosafari",
+	transport.FingerprintIOS, "helloios",
+	transport.FingerprintAndroid, "helloandroid",
+	transport.FingerprintEdge, "helloedge",
+	transport.FingerprintRandomized, "random", "hellorandomized",
+}
+
+// isUTLSFingerprint reports whether name (already trimmed and lower-cased) is a
+// uTLS profile name transport would resolve.
+func isUTLSFingerprint(name string) bool {
+	for _, n := range utlsFingerprintNames {
+		if name == n {
+			return true
+		}
+	}
+	return false
+}
+
+// certPin decodes the SHA-256 digest of the server certificate carried in
+// tls.fingerprint, which Hysteria2 nodes use instead of a CA chain (colons are
+// accepted as separators, matching openssl and Clash output; hex is
+// case-insensitive).
+//
+// tls.fingerprint is also where other protocols keep the uTLS fingerprint name
+// ("chrome", "firefox", ...), so a *known* profile name still means "no pin":
+// this package uses crypto/tls, cannot apply the profile, and keeps the CA
+// behaviour it had before.
+//
+// Everything else must decode as a digest. A value that is neither a known
+// profile name nor a SHA-256 pin is an error, because reporting "no pin" for a
+// mistyped digest silently removes the only authentication constraint the node
+// has and lets the client talk to any self-signed peer.
+func certPin(fingerprint string) ([]byte, error) {
+	name := strings.ToLower(strings.TrimSpace(fingerprint))
+	if name == "" {
+		return nil, nil
+	}
+	if isUTLSFingerprint(name) {
+		return nil, nil
+	}
+	bare := strings.NewReplacer(":", "", " ", "").Replace(name)
+	for _, c := range bare {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return nil, fmt.Errorf("tls.fingerprint %q: not a SHA-256 certificate pin and not a known uTLS fingerprint (%s)",
+				fingerprint, strings.Join(utlsFingerprintNames, ", "))
+		}
+	}
+	pin, err := hex.DecodeString(bare)
+	if err != nil {
+		// Hex digits only, so the user meant a pin and mistyped its length.
+		return nil, fmt.Errorf("tls.fingerprint %q: %w", fingerprint, err)
+	}
+	if len(pin) != sha256.Size {
+		return nil, fmt.Errorf("tls.fingerprint %q: want a %d-byte SHA-256 digest, got %d bytes",
+			fingerprint, sha256.Size, len(pin))
+	}
+	return pin, nil
 }
 
 func buildQUICConfig() *quic.Config {
@@ -119,6 +233,25 @@ func buildQUICConfig() *quic.Config {
 		InitialConnectionReceiveWindow: 8 << 20,
 		MaxConnectionReceiveWindow:     16 << 20,
 	}
+}
+
+// obfsFromNode returns the obfuscator the node asks for, or nil for plain QUIC.
+// The settings are carried in Transport.Headers ("obfs", "obfs-password") by the
+// share and Clash importers; anything but salamander would silently mismatch the
+// server, so an unknown type is an error rather than a no-op.
+func obfsFromNode(n config.Node) (*salamander, error) {
+	if n.Transport == nil {
+		return nil, nil
+	}
+	kind := strings.ToLower(strings.TrimSpace(n.Transport.Headers["obfs"]))
+	switch kind {
+	case "", "none":
+		return nil, nil
+	case "salamander":
+	default:
+		return nil, fmt.Errorf("unsupported obfs %q", n.Transport.Headers["obfs"])
+	}
+	return newSalamander(n.Transport.Headers["obfs-password"])
 }
 
 // Tag implements outbound.Outbound.
@@ -249,14 +382,31 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, *quic.Transport, net.Pac
 		ctx, cancel = context.WithTimeout(ctx, dialTimeout)
 		defer cancel()
 	}
-	serverAddr, err := c.resolveServer(ctx)
+	serverAddr, err := c.resolveServer(ctx, dnsResolver)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	pkt, err := net.ListenUDP("udp", nil)
+	pkt, err := listenPacket(ctx)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("hysteria2 %s: %w", c.tag, err)
 	}
+	// Raw counter sits under the obfs layer: comparing it with the outer counter
+	// is what tells "the server answered with obfuscated bytes we decoded into
+	// garbage" apart from "the server answered in plaintext".
+	raw := &countingConn{PacketConn: pkt}
+	pkt = raw
+	if c.obfs != nil {
+		// Obfuscation sits above the protected socket: every datagram QUIC puts
+		// on the wire is wrapped, and the fd was already handed to the protector.
+		pkt = newSalamanderConn(pkt, c.obfs)
+	}
+	// Count what the handshake actually put on the wire. Without this a failed
+	// dial on a device is indistinguishable between "nothing was sent" (socket
+	// captured by the tun, no route) and "sent, nothing came back" (server or
+	// middlebox dropped us), and both look like the same timeout.
+	counted := &countingConn{PacketConn: pkt}
+	pkt = counted
+
 	tr := &quic.Transport{Conn: pkt}
 	// quic-go wants an address for the transport; listen on the unspecified
 	// address of the same family as the server.
@@ -264,7 +414,8 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, *quic.Transport, net.Pac
 	if err != nil {
 		_ = tr.Close()
 		_ = pkt.Close()
-		return nil, nil, nil, fmt.Errorf("hysteria2 %s: quic dial %s: %w", c.tag, serverAddr, err)
+		return nil, nil, nil, fmt.Errorf("hysteria2 %s: quic dial %s: %w (local %s, wire %s, raw %s)",
+			c.tag, serverAddr, err, pkt.LocalAddr(), counted, raw)
 	}
 	if err := c.authenticate(ctx, conn); err != nil {
 		_ = conn.CloseWithError(0, "")
@@ -275,7 +426,125 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, *quic.Transport, net.Pac
 	return conn, tr, pkt, nil
 }
 
-func (c *Client) resolveServer(ctx context.Context) (*net.UDPAddr, error) {
+// countingConn tallies datagrams so a failed QUIC dial can report whether the
+// socket put anything on the wire at all.
+type countingConn struct {
+	net.PacketConn
+	sentPkts, sentBytes, recvPkts, recvBytes atomic.Int64
+
+	// First datagram that came back: its source and leading bytes are what tells
+	// a QUIC version negotiation apart from a Retry, an ICMP-driven error or a
+	// middlebox talking to us.
+	recvMu    sync.Mutex
+	firstFrom string
+	firstRecv []byte
+}
+
+func (c *countingConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(p, addr)
+	if n > 0 {
+		c.sentPkts.Add(1)
+		c.sentBytes.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *countingConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	if n > 0 {
+		c.recvPkts.Add(1)
+		c.recvBytes.Add(int64(n))
+		c.recvMu.Lock()
+		if c.firstFrom == "" {
+			c.firstFrom = addr.String()
+			head := n
+			if head > 24 {
+				head = 24
+			}
+			c.firstRecv = append([]byte(nil), p[:head]...)
+		}
+		c.recvMu.Unlock()
+	}
+	return n, addr, err
+}
+
+// SyscallConn forwards to the socket underneath every wrapper. quic-go and the
+// protect test both reach for the raw descriptor through it; hiding it behind a
+// counting shim silently disables socket options (buffer sizing, PMTU).
+func (c *countingConn) SyscallConn() (syscall.RawConn, error) {
+	if sc, ok := c.PacketConn.(syscall.Conn); ok {
+		return sc.SyscallConn()
+	}
+	return nil, fmt.Errorf("hysteria2: %T exposes no syscall handle", c.PacketConn)
+}
+
+// SetReadBuffer / SetWriteBuffer keep quic-go's socket tuning working through
+// the counter.
+func (c *countingConn) SetReadBuffer(n int) error {
+	if u, ok := c.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return u.SetReadBuffer(n)
+	}
+	return nil
+}
+
+func (c *countingConn) SetWriteBuffer(n int) error {
+	if u, ok := c.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
+		return u.SetWriteBuffer(n)
+	}
+	return nil
+}
+
+func (c *countingConn) String() string {
+	c.recvMu.Lock()
+	from, head := c.firstFrom, append([]byte(nil), c.firstRecv...)
+	c.recvMu.Unlock()
+	s := fmt.Sprintf("sent %d pkts/%d B, recv %d pkts/%d B",
+		c.sentPkts.Load(), c.sentBytes.Load(), c.recvPkts.Load(), c.recvBytes.Load())
+	if from != "" {
+		s += fmt.Sprintf(", first from %s head %x", from, head)
+	}
+	return s
+}
+
+// listenPacket opens the UDP socket the QUIC transport rides on. The Control
+// hook runs transport.ProtectFD while the socket is still unbound, so on
+// HarmonyOS the descriptor reaches VpnConnection.protect before the first
+// datagram: an unprotected socket would be captured by our own tun and the
+// tunnel would eat its own packets (AGENTS.md invariant 1). transport only
+// offers UDP protection as a standalone helper, so the ListenConfig lives here
+// instead of using net.ListenUDP.
+func listenPacket(ctx context.Context) (net.PacketConn, error) {
+	lc := net.ListenConfig{Control: func(network, address string, c syscall.RawConn) error {
+		var perr error
+		if err := c.Control(func(fd uintptr) {
+			perr = transport.ProtectFD(fd)
+		}); err != nil {
+			return err
+		}
+		return perr
+	}}
+	return lc.ListenPacket(ctx, "udp", ":0")
+}
+
+// dnsResolver turns a node's server name into an address. Dialing through
+// transport is the point: net.DefaultResolver uses an unpatched net.Dialer, so
+// the nameserver socket never reaches VpnConnection.protect and the query is
+// captured by our own tun exactly like an unprotected QUIC socket would be
+// (AGENTS.md invariant 1). PreferGo keeps the Go resolver in charge where cgo
+// is available, because the cgo resolver ignores Dial and would go back to an
+// unprotected socket; the OHOS build is CGO_ENABLED=0 and already netgo.
+var dnsResolver = &net.Resolver{PreferGo: true, Dial: protectedDial}
+
+// protectedDial is the resolver's Dial hook: a protect-aware socket to the
+// nameserver the system resolver configuration points at.
+func protectedDial(ctx context.Context, network, address string) (net.Conn, error) {
+	return transport.NewDialer().DialContext(ctx, network, address)
+}
+
+// resolveServer turns the node's server into the UDP address quic-go dials. r is
+// dnsResolver outside tests; it is a parameter so a test can aim the lookup at
+// a local nameserver while the production dial hook stays in the path.
+func (c *Client) resolveServer(ctx context.Context, r *net.Resolver) (*net.UDPAddr, error) {
 	host, portStr, err := net.SplitHostPort(c.serverAddr)
 	if err != nil {
 		return nil, fmt.Errorf("hysteria2 %s: %w", c.tag, err)
@@ -287,7 +556,7 @@ func (c *Client) resolveServer(ctx context.Context) (*net.UDPAddr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip.Unmap(), uint16(port))), nil
 	}
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	ips, err := r.LookupNetIP(ctx, "ip", host)
 	if err != nil {
 		return nil, fmt.Errorf("hysteria2 %s: resolve %s: %w", c.tag, host, err)
 	}

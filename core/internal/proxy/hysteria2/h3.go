@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
@@ -192,8 +193,18 @@ func appendQPACKString(dst []byte, s string) []byte {
 // become indexed field lines, known names become name references and everything
 // else becomes a literal name.
 func encodeFieldSection(fields []headerField) []byte {
-	var out []byte
+	// RFC 9204 §4.5.1: every field section starts with the Encoded Field Section
+	// Prefix. Without a dynamic table Required Insert Count is 0, and the Delta
+	// Base equals it, so the prefix is the two bytes 0x00 0x00. Omitting it made
+	// a real server read our first field line as the prefix and answer
+	// QPACK_DECOMPRESSION_FAILED (HTTP/3 stream error 0x200).
+	out := []byte{0x00, 0x00}
 	for _, f := range fields {
+		// HTTP/3 field names are lowercase on the wire; a real server rejects an
+		// uppercase one with H3_MESSAGE_ERROR (0x10e). hysteria's canonical
+		// spelling ("Hysteria-Auth") is only used inside this package, so
+		// normalise here instead of at every call site.
+		f.name = strings.ToLower(f.name)
 		if i := staticIndex(f.name, f.value); i >= 0 {
 			out = appendQPACKInt(out, uint64(i), 6, 0xC0) // 1 1 index(6+)
 			continue
@@ -265,6 +276,27 @@ func readQPACKString(b []byte) (string, int, error) {
 // Dynamic-table references are rejected: we advertise a capacity of zero, so a
 // conforming server never emits them.
 func decodeFieldSection(b []byte) ([]headerField, error) {
+	// RFC 9204 §4.5.1: the Encoded Field Section Prefix comes first — Encoded
+	// Required Insert Count (8-bit prefix) then Delta Base (7-bit prefix and
+	// sign) — and has to be consumed before the field lines. With no dynamic
+	// table it is 0x00 0x00; without consuming it the first field line looked
+	// like a prefix and the prefix looked like "unsupported qpack
+	// representation 0x00".
+	insertCount, n, err := readQPACKInt(b, 8)
+	if err != nil {
+		return nil, err
+	}
+	if insertCount != 0 {
+		// openH3Streams advertises a dynamic-table capacity of 0, so the only
+		// Encoded Required Insert Count a conforming peer may send is 0.
+		return nil, fmt.Errorf("hysteria2: qpack required insert count %d with an empty dynamic table", insertCount)
+	}
+	b = b[n:]
+	if _, n, err = readQPACKInt(b, 7); err != nil {
+		return nil, err
+	}
+	b = b[n:]
+
 	var out []headerField
 	for len(b) > 0 {
 		first := b[0]
@@ -441,9 +473,14 @@ func statusOf(fields []headerField) (int, error) {
 }
 
 // headerValue returns the first value of name, or "".
+//
+// The comparison ignores case: decoded field names are lowercase (HTTP/3
+// requires it), while the constants in this package keep hysteria's canonical
+// spelling ("Hysteria-UDP"). A case-sensitive lookup silently missed the
+// server's reply about UDP relaying.
 func headerValue(fields []headerField, name string) string {
 	for _, f := range fields {
-		if f.name == name {
+		if strings.EqualFold(f.name, name) {
 			return f.value
 		}
 	}
