@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,6 +154,134 @@ func TestDialOutsideAllowedIPsFailsFast(t *testing.T) {
 	// UDP goes through the same check.
 	if _, err := c.DialPacket(ctx, "93.184.216.34:53"); err == nil || !strings.Contains(err.Error(), "allowed_ips") {
 		t.Fatalf("DialPacket outside allowed_ips = %v, want an allowed_ips error", err)
+	}
+}
+
+// TestTunnelLookupHonoursCancel is the cancellation regression for in-tunnel
+// names.
+//
+// The stack's own resolver only derives a socket deadline from the context, so
+// cancelling a lookup left the caller waiting out the resolver's retry budget
+// (review: still running 200ms after cancel). The query socket now belongs to
+// the lookup, so cancelling closes it and the dial returns at once.
+func TestTunnelLookupHonoursCancel(t *testing.T) {
+	clientPriv, clientPub := keyPair(t)
+	serverPriv, serverPub := keyPair(t)
+	srv := startWGServer(t, serverPriv, clientPub)
+
+	// An in-tunnel nameserver that consumes queries and never answers.
+	dnsPC, err := srv.stack.ListenUDPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(serverAddr), 53))
+	if err != nil {
+		t.Fatalf("listen dns in peer stack: %v", err)
+	}
+	t.Cleanup(func() { _ = dnsPC.Close() })
+	querySeen := make(chan struct{})
+	var once sync.Once
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			if _, _, err := dnsPC.ReadFrom(buf); err != nil {
+				return
+			}
+			once.Do(func() { close(querySeen) })
+		}
+	}()
+
+	node := clientNode(t, srv.port, clientPriv, serverPub)
+	node.DNS = []string{serverAddr}
+	c, err := New(node)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dialErr := make(chan error, 1)
+	go func() {
+		_, err := c.DialContext(ctx, "tcp", net.JoinHostPort("split.horizon.internal", "80"))
+		dialErr <- err
+	}()
+
+	select {
+	case <-querySeen:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the in-tunnel resolver was never asked")
+	}
+
+	cancelled := time.Now()
+	cancel()
+	select {
+	case <-dialErr:
+		if waited := time.Since(cancelled); waited > 100*time.Millisecond {
+			t.Fatalf("the lookup returned %v after cancel, want under 100ms", waited)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the in-tunnel lookup ignored the caller's cancel")
+	}
+}
+
+// TestDialSurvivesSilentInTunnelResolver is the same budget rule one level
+// down: a node may list several in-tunnel resolvers, and the first one being
+// silent must not keep the second from being asked before the dial deadline.
+func TestDialSurvivesSilentInTunnelResolver(t *testing.T) {
+	const (
+		silentAddr = "10.9.9.1"
+		answering  = "10.9.9.5"
+	)
+	clientPriv, clientPub := keyPair(t)
+	serverPriv, serverPub := keyPair(t)
+	srv := startWGServerAddrs(t, serverPriv, clientPub, []netip.Addr{
+		netip.MustParseAddr(silentAddr), netip.MustParseAddr(answering),
+	})
+	tcpPort, _ := startTCPEchoCountAt(t, srv.stack, netip.MustParseAddr(answering))
+
+	// The first resolver consumes queries and never answers.
+	silent, err := srv.stack.ListenUDPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(silentAddr), 53))
+	if err != nil {
+		t.Fatalf("listen silent dns in peer stack: %v", err)
+	}
+	t.Cleanup(func() { _ = silent.Close() })
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			if _, _, err := silent.ReadFrom(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	// The second one answers with itself, which the peer carries.
+	good, err := srv.stack.ListenUDPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(answering), 53))
+	if err != nil {
+		t.Fatalf("listen answering dns in peer stack: %v", err)
+	}
+	t.Cleanup(func() { _ = good.Close() })
+	serveDNS(good, netip.MustParseAddr(answering))
+
+	node := clientNode(t, srv.port, clientPriv, serverPub)
+	node.DNS = []string{silentAddr, answering}
+	node.AllowedIPs = []string{"10.9.9.0/24"}
+	c, err := New(node)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	const budget = 3 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	target := net.JoinHostPort("homelab.secondresolver.internal", strconv.Itoa(tcpPort))
+	started := time.Now()
+	conn, err := c.DialContext(ctx, "tcp", target)
+	took := time.Since(started)
+	if err != nil {
+		t.Fatalf("DialContext(%s) with a silent first resolver: %v (after %v)", target, err, took)
+	}
+	defer conn.Close()
+	echoOnce(t, conn, "second resolver")
+	if took >= budget {
+		t.Fatalf("the dial took %v of its %v deadline: the silent resolver kept the budget for itself", took, budget)
 	}
 }
 

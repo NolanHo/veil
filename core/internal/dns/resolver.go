@@ -95,22 +95,42 @@ func (r *Resolver) debugf(format string, args ...any) {
 	}
 }
 
-// cacheGet returns a cached result; ok reports whether the entry was fresh.
-func (st *state) cacheGet(key string) (addrs []netip.Addr, err error, ok bool) {
+// lookupDecision is beginLookup's answer: either a cached result, an in-flight
+// lookup to wait on, or (leader) a flight the caller has to perform itself.
+type lookupDecision struct {
+	cached bool
+	addrs  []netip.Addr
+	err    error
+	flight *flight
+	leader bool
+}
+
+// beginLookup decides, under one lock, whether this caller is answered from the
+// cache, joins a flight, or starts one. Cache check and flight registration have
+// to be the same decision: taken separately, a caller that had already missed
+// the cache could register a second flight after another caller's flight had
+// finished and gone, sending the same name upstream twice.
+func (st *state) beginLookup(key string, useCache bool, now time.Time) lookupDecision {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	el, found := st.items[key]
-	if !found {
-		return nil, nil, false
+	if useCache {
+		if el, found := st.items[key]; found {
+			ent := el.Value.(*cacheEntry)
+			if now.After(ent.expires) {
+				st.order.Remove(el)
+				delete(st.items, key)
+			} else {
+				st.order.MoveToFront(el)
+				return lookupDecision{cached: true, addrs: ent.addrs, err: ent.err}
+			}
+		}
 	}
-	ent := el.Value.(*cacheEntry)
-	if time.Now().After(ent.expires) {
-		st.order.Remove(el)
-		delete(st.items, key)
-		return nil, nil, false
+	if f, ok := st.flight[key]; ok {
+		return lookupDecision{flight: f}
 	}
-	st.order.MoveToFront(el)
-	return ent.addrs, ent.err, true
+	f := &flight{done: make(chan struct{})}
+	st.flight[key] = f
+	return lookupDecision{flight: f, leader: true}
 }
 
 func (st *state) cachePut(ent *cacheEntry) {
@@ -153,31 +173,25 @@ func (r *Resolver) lookup(ctx context.Context, host string) ([]netip.Addr, error
 	}
 	st := r.state()
 	useCache := r.cfg.Cache
-	if useCache {
-		if addrs, err, ok := st.cacheGet(name); ok {
-			return addrs, err
-		}
+	d := st.beginLookup(name, useCache, time.Now())
+	if d.cached {
+		return d.addrs, d.err
 	}
-
-	st.mu.Lock()
-	if f, ok := st.flight[name]; ok {
-		st.mu.Unlock()
+	if !d.leader {
 		select {
-		case <-f.done:
-			return f.addrs, f.err
+		case <-d.flight.done:
+			return d.flight.addrs, d.flight.err
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
-	f := &flight{done: make(chan struct{})}
-	st.flight[name] = f
-	st.mu.Unlock()
 
 	addrs, ttl, err := r.resolve(ctx, name)
 	if err == nil && len(addrs) == 0 {
 		err = fmt.Errorf("dns: no addresses for %s", name)
 	}
-	if useCache && ctx.Err() == nil {
+	store := useCache && ctx.Err() == nil
+	if store {
 		ent := &cacheEntry{key: name, addrs: addrs, expires: time.Now().Add(ttl)}
 		if err != nil {
 			ent.addrs = nil
@@ -188,10 +202,12 @@ func (r *Resolver) lookup(ctx context.Context, host string) ([]netip.Addr, error
 	}
 
 	st.mu.Lock()
-	delete(st.flight, name)
+	if st.flight[name] == d.flight {
+		delete(st.flight, name)
+	}
 	st.mu.Unlock()
-	f.addrs, f.err = addrs, err
-	close(f.done)
+	d.flight.addrs, d.flight.err = addrs, err
+	close(d.flight.done)
 	if r.log != nil {
 		if err != nil {
 			r.log.Debugf("dns %s -> error: %v", name, err)

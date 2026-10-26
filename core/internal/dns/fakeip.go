@@ -5,22 +5,33 @@ import (
 	"sync"
 )
 
-// fakeIPPool hands out synthetic addresses for domains and maps them back.
+// FakePool hands out synthetic addresses for domains and maps them back.
 //
 // Why: DNS must be answered at the *proxy* end. A client-side resolver (even
 // DoH) either gets poisoned answers or leaks which sites you visit. With
 // fake-IP the tunnel answers every A query with 198.18.x.x, and the engine
 // turns that address back into the domain, so the proxy resolves the name and
 // the local network never sees a real lookup.
-type fakeIPPool struct {
+//
+// One pool per engine, not one per resolver. A reload builds a new resolver but
+// keeps this object (see Engine.Reload and NewWithPool), which is what makes the
+// mapping consistent across a reload: there is only ever one allocator, so the
+// address the outgoing resolver just handed to one name can never be handed to a
+// different name by the incoming one. Copying the mappings into a fresh pool
+// would not give that guarantee — the copy is a snapshot, and an address
+// allocated from the old pool after the snapshot would be reissued by the new
+// one for another domain, silently routing the older connection to the wrong
+// host.
+type FakePool struct {
 	mu     sync.RWMutex
 	byIP   map[netip.Addr]string
 	byHost map[string]netip.Addr
 	next   uint32
 }
 
-func newFakeIPPool() *fakeIPPool {
-	return &fakeIPPool{
+// NewFakePool returns an empty pool.
+func NewFakePool() *FakePool {
+	return &FakePool{
 		byIP:   make(map[netip.Addr]string, 1024),
 		byHost: make(map[string]netip.Addr, 1024),
 		next:   1,
@@ -28,7 +39,7 @@ func newFakeIPPool() *fakeIPPool {
 }
 
 // ipFor returns the fake address for host, allocating one if needed.
-func (p *fakeIPPool) ipFor(host string) netip.Addr {
+func (p *FakePool) ipFor(host string) netip.Addr {
 	if host == "" {
 		return netip.Addr{}
 	}
@@ -53,41 +64,8 @@ func (p *fakeIPPool) ipFor(host string) netip.Addr {
 	return netip.Addr{}
 }
 
-// adopt copies every mapping from old. A resolver reload builds a fresh pool,
-// and the applications on the device keep using the addresses the old pool
-// handed out — without this, those connections arrive as bare 198.18.x.x
-// destinations whose domain nobody knows any more.
-func (p *fakeIPPool) adopt(old *fakeIPPool) {
-	if old == nil {
-		return
-	}
-	old.mu.RLock()
-	byIP := make(map[netip.Addr]string, len(old.byIP))
-	byHost := make(map[string]netip.Addr, len(old.byHost))
-	for k, v := range old.byIP {
-		byIP[k] = v
-	}
-	for k, v := range old.byHost {
-		byHost[k] = v
-	}
-	next := old.next
-	old.mu.RUnlock()
-
-	p.mu.Lock()
-	for k, v := range byIP {
-		p.byIP[k] = v
-	}
-	for k, v := range byHost {
-		p.byHost[k] = v
-	}
-	if next > p.next {
-		p.next = next
-	}
-	p.mu.Unlock()
-}
-
 // hostFor resolves a fake address back to its domain.
-func (p *fakeIPPool) hostFor(ip netip.Addr) (string, bool) {
+func (p *FakePool) hostFor(ip netip.Addr) (string, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	h, ok := p.byIP[ip]

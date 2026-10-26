@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,24 +50,34 @@ func startWGServerAddrs(t *testing.T, serverPriv, clientPub string, addrs []neti
 // its port.
 func startTCPEchoAt(t *testing.T, ns *netstack.Net, ip netip.Addr) int {
 	t.Helper()
+	port, _ := startTCPEchoCountAt(t, ns, ip)
+	return port
+}
+
+// startTCPEchoCountAt is startTCPEchoAt plus a counter of accepted connections,
+// so a test can prove a dial actually reached this candidate.
+func startTCPEchoCountAt(t *testing.T, ns *netstack.Net, ip netip.Addr) (port int, accepted func() int64) {
+	t.Helper()
 	ln, err := ns.ListenTCPAddrPort(netip.AddrPortFrom(ip, 0))
 	if err != nil {
 		t.Fatalf("listen tcp at %s in stack: %v", ip, err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
+	var seen int64
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			atomic.AddInt64(&seen, 1)
 			go func() {
 				defer c.Close()
 				_, _ = io.Copy(c, c)
 			}()
 		}
 	}()
-	return ln.Addr().(*net.TCPAddr).Port
+	return ln.Addr().(*net.TCPAddr).Port, func() int64 { return atomic.LoadInt64(&seen) }
 }
 
 // echoOnce writes payload through conn and reads the echo back.
@@ -186,6 +197,71 @@ func TestDialTriesEveryCandidate(t *testing.T) {
 	}
 	defer conn.Close()
 	echoOnce(t, conn, "second candidate")
+}
+
+// TestDialBlackholeCandidateDoesNotEatTheDeadline is the deadline regression of
+// that same walk.
+//
+// Every candidate used to be dialed with the caller's full context, so a first
+// candidate that silently drops the SYN — the peer carries the prefix but no
+// host owns the address, so not even an RST comes back — spent the whole
+// deadline and the reachable candidate behind it was never dialed (review: "1s
+// later: context deadline exceeded", with the service up on the second
+// address). Each candidate now gets its own share of what is left, so the dial
+// still ends at the caller's deadline while the second candidate is reached.
+func TestDialBlackholeCandidateDoesNotEatTheDeadline(t *testing.T) {
+	const (
+		peerAddr      = "10.9.9.1"
+		serviceAddr   = "10.9.9.5"
+		blackholeAddr = "10.9.9.200" // inside allowed_ips, owned by no host: SYN is dropped
+	)
+	clientPriv, clientPub := keyPair(t)
+	serverPriv, serverPub := keyPair(t)
+	srv := startWGServerAddrs(t, serverPriv, clientPub, []netip.Addr{
+		netip.MustParseAddr(peerAddr), netip.MustParseAddr(serviceAddr),
+	})
+	tcpPort, accepted := startTCPEchoCountAt(t, srv.stack, netip.MustParseAddr(serviceAddr))
+
+	dnsPC, err := srv.stack.ListenUDPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(peerAddr), 53))
+	if err != nil {
+		t.Fatalf("listen dns in peer stack: %v", err)
+	}
+	t.Cleanup(func() { _ = dnsPC.Close() })
+	serveDNSMulti(dnsPC, []netip.Addr{
+		netip.MustParseAddr(blackholeAddr), netip.MustParseAddr(serviceAddr),
+	})
+
+	node := clientNode(t, srv.port, clientPriv, serverPub)
+	node.DNS = []string{peerAddr}
+	node.AllowedIPs = []string{"10.9.9.0/24"}
+	c, err := New(node)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	const budget = 3 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	target := net.JoinHostPort("homelab.blackhole.internal", strconv.Itoa(tcpPort))
+	started := time.Now()
+	conn, err := c.DialContext(ctx, "tcp", target)
+	took := time.Since(started)
+	if err != nil {
+		t.Fatalf("DialContext(%s) with the service on the second candidate: %v (after %v)", target, err, took)
+	}
+	defer conn.Close()
+	echoOnce(t, conn, "second candidate")
+
+	if took >= budget {
+		t.Fatalf("the dial took %v of its %v deadline: the blackhole candidate kept the budget for itself", took, budget)
+	}
+	if took < time.Second {
+		t.Fatalf("the dial took %v: the blackhole candidate was skipped instead of tried", took)
+	}
+	if n := accepted(); n == 0 {
+		t.Fatal("the reachable candidate never saw a connection")
+	}
 }
 
 // TestCloseCancelsTargetResolution is the cancellation regression.

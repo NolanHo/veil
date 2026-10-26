@@ -139,6 +139,56 @@ proxies:
 	}
 }
 
+// TestClashDedupeKeepsDistinctCertPins is the certificate-pin regression: two
+// hysteria2 entries that differ only in `fingerprint` authenticate different
+// peers — each is pinned to a certificate the other would reject — while the
+// de-duplication key ignored tls.fingerprint and merged them. The group naming
+// the second entry then resolved through the merge alias to the first node, so
+// the profile connected to a peer it was pinned away from.
+func TestClashDedupeKeepsDistinctCertPins(t *testing.T) {
+	pinA := strings.Repeat("AB", 32)
+	pinB := strings.Repeat("CD", 32)
+	doc := fmt.Sprintf(`
+proxies:
+  - name: "hy2-a"
+    type: hysteria2
+    server: hk.example.net
+    port: 443
+    password: pw
+    sni: hk.example.net
+    fingerprint: %s
+  - name: "hy2-b"
+    type: hysteria2
+    server: hk.example.net
+    port: 443
+    password: pw
+    sni: hk.example.net
+    fingerprint: %s
+proxy-groups:
+  - name: "pinned"
+    type: select
+    proxies: ["hy2-b"]
+`, pinA, pinB)
+
+	cfg, errs := ParseClashConfig([]byte(doc), "sub")
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(cfg.Nodes) != 2 {
+		t.Fatalf("nodes = %d (%+v), want 2: the entries differ in their certificate pin", len(cfg.Nodes), cfg.Nodes)
+	}
+	eq(t, "pin0", cfg.Nodes[0].TLS.Fingerprint, pinA)
+	eq(t, "pin1", cfg.Nodes[1].TLS.Fingerprint, pinB)
+
+	// The group must keep addressing the node it named, not the one the merge
+	// used to redirect it to.
+	if len(cfg.Groups) != 1 {
+		t.Fatalf("groups = %+v, want one", cfg.Groups)
+	}
+	eq(t, "member", strings.Join(cfg.Groups[0].Members, ","), cfg.Nodes[1].Tag)
+	eq(t, "second tag", cfg.Nodes[1].Tag, "hy2-b")
+}
+
 // TestClashBadNodeDoesNotAbortImport is the S7 regression: one malformed entry
 // must cost that entry, not the whole subscription.
 func TestClashBadNodeDoesNotAbortImport(t *testing.T) {

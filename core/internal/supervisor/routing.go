@@ -75,16 +75,6 @@ type routingOrigin struct {
 	OwnsTable bool
 }
 
-// mergeRouting folds one document's routing table into the live configuration.
-func (s *Supervisor) mergeRouting(t routingTable, origin routingOrigin) (groupCount, ruleCount int, warnings []string) {
-	if !t.GroupsProvided && !t.RulesProvided {
-		return 0, 0, nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return mergeRoutingTable(&s.cfg, t, origin)
-}
-
 // mergeRoutingTable folds t into cfg and reports how many groups and rules the
 // document contributed.
 //

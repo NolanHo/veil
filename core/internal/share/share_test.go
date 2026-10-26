@@ -377,6 +377,50 @@ proxies:
 	eqInt(t, "nodes", len(nodes), 5)
 }
 
+// TestDedupeKeyCoversTLSIdentity pins which TLS fields decide node identity.
+//
+// A field that changes how the peer is authenticated or how the handshake is
+// spelled makes a different node: merging two of them silently redirects every
+// group and rule that names the second spelling to the first node. The
+// certificate pin is the sharpest case (see
+// TestClashDedupeKeepsDistinctCertPins); insecure, ALPN and the server name
+// change the handshake just as much.
+func TestDedupeKeyCoversTLSIdentity(t *testing.T) {
+	base := config.Node{
+		Type:     "hysteria2",
+		Server:   "hk.example.net",
+		Port:     443,
+		Password: "pw",
+		TLS:      &config.TLS{Enabled: true, ServerName: "hk.example.net"},
+		Remark:   "same",
+	}
+	cases := []struct {
+		field  string
+		mutate func(*config.TLS)
+	}{
+		{"fingerprint", func(tls *config.TLS) { tls.Fingerprint = "AB:CD" }},
+		{"insecure", func(tls *config.TLS) { tls.Insecure = true }},
+		{"alpn", func(tls *config.TLS) { tls.ALPN = []string{"h3"} }},
+		{"servername", func(tls *config.TLS) { tls.ServerName = "other.example.net" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			other := base
+			tls := *base.TLS
+			tc.mutate(&tls)
+			other.TLS = &tls
+			if got := len(finalize([]config.Node{base, other})); got != 2 {
+				t.Fatalf("de-duplication kept %d node(s), want 2: %s changes the peer identity", got, tc.field)
+			}
+		})
+	}
+
+	// The additions must not stop real duplicates from merging.
+	if got := len(finalize([]config.Node{base, base})); got != 1 {
+		t.Fatalf("two identical nodes produced %d entries, want 1", got)
+	}
+}
+
 // stripVolatile clears fields that are not part of a link round-trip.
 func stripVolatile(n config.Node) config.Node {
 	n.Tag = ""

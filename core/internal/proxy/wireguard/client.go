@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	mdns "github.com/miekg/dns"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -294,18 +295,26 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 // while only one of them is reachable through the peer (the usual homelab name
 // publishes a v4 and a v6 address while allowed_ips covers one), and stopping at
 // the first was a failure the caller had no way to work around.
+//
+// Each candidate gets its own share of the caller's remaining time (see
+// dialCandidate): a candidate the peer silently drops never answers, so handing
+// every candidate the whole context let the first one spend the entire deadline
+// and the reachable candidates behind it were never dialed.
 func (c *Client) dialTCP(ctx context.Context, ns *netstack.Net, network, address string) (net.Conn, error) {
 	cands, err := c.tunnelCandidates(ctx, ns, address)
 	if err != nil {
 		return nil, err
 	}
 	family := familyOf(network)
-	var lastErr error
+	usable := make([]netip.AddrPort, 0, len(cands))
 	for _, ap := range cands {
-		if !family.allows(ap.Addr()) {
-			continue
+		if family.allows(ap.Addr()) {
+			usable = append(usable, ap)
 		}
-		conn, err := ns.DialContextTCPAddrPort(ctx, ap)
+	}
+	var lastErr error
+	for i, ap := range usable {
+		conn, err := dialCandidate(ctx, ns, ap, len(usable)-i)
 		if err == nil {
 			return conn, nil
 		}
@@ -319,6 +328,27 @@ func (c *Client) dialTCP(ctx context.Context, ns *netstack.Net, network, address
 	}
 	return nil, fmt.Errorf("wireguard %s: dial %s: the peer carries no %s address for this destination (resolved %s)",
 		c.tag, address, family, addrPortList(cands))
+}
+
+// dialCandidate tries one candidate within its own budget. remaining is how many
+// candidates are left to try, this one included; each gets an even share of the
+// time the caller has left, so the last one inherits the remainder and the total
+// still ends at the caller's deadline.
+func dialCandidate(ctx context.Context, ns *netstack.Net, ap netip.AddrPort, remaining int) (net.Conn, error) {
+	attempt, cancel := context.WithTimeout(ctx, remainingShare(ctx, remaining, dialTimeout))
+	defer cancel()
+	return ns.DialContextTCPAddrPort(attempt, ap)
+}
+
+// remainingShare is an even share of the time the caller has left, for one of
+// remaining attempts, so the last attempt inherits the remainder. Without a
+// deadline there is nothing to divide and fallback stands in for it.
+func remainingShare(ctx context.Context, remaining int, fallback time.Duration) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok || remaining < 1 {
+		return fallback
+	}
+	return time.Until(deadline) / time.Duration(remaining)
 }
 
 // DialPacket opens a UDP association to address through the tunnel.
@@ -592,14 +622,8 @@ func (c *Client) tunnelCandidates(ctx context.Context, ns *netstack.Net, address
 
 	var ips []netip.Addr
 	if len(c.dns) > 0 {
-		addrs, err := ns.LookupContextHost(ctx, host)
-		if err != nil {
+		if ips, err = c.tunnelLookup(ctx, ns, host); err != nil {
 			return nil, fmt.Errorf("wireguard %s: resolve %s in tunnel: %w", c.tag, host, err)
-		}
-		for _, a := range addrs {
-			if ip, err := netip.ParseAddr(a); err == nil {
-				ips = append(ips, ip)
-			}
 		}
 	} else {
 		if ips, err = c.resolver.LookupNetIP(ctx, "ip", host); err != nil {
@@ -641,6 +665,145 @@ func (c *Client) tunnelCandidates(ctx context.Context, ns *netstack.Net, address
 		return nil, fmt.Errorf("wireguard %s: resolve %s: no address", c.tag, host)
 	}
 	return append(v4, v6...), nil
+}
+
+// tunnelLookup resolves host through the node's in-tunnel resolvers.
+//
+// The stack has a resolver of its own (netstack.Net.LookupContextHost), and it
+// is not usable here: its read path derives only a socket deadline from the
+// context, so a caller that gives up keeps waiting for the resolver's retry
+// budget — the review measured 200ms and climbing after a cancel. The query
+// socket below belongs to this call (see exchangeTunnel), so cancelling the
+// caller closes it and the read returns at once.
+//
+// Resolvers are tried in the order the node lists them, each with an even share
+// of the time the lookup has left (see remainingShare): a resolver that never
+// answers must not keep the next one from being asked. A resolver that answers
+// with no address at all is a failure too.
+func (c *Client) tunnelLookup(ctx context.Context, ns *netstack.Net, host string) ([]netip.Addr, error) {
+	var lastErr error
+	for i, server := range c.dns {
+		attempt, cancel := context.WithTimeout(ctx, remainingShare(ctx, len(c.dns)-i, tunnelDNSTimeout))
+		addrs, err := c.exchangeTunnel(attempt, ns, server, host)
+		cancel()
+		if err == nil && len(addrs) > 0 {
+			return addrs, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no address")
+	}
+	return nil, lastErr
+}
+
+const (
+	// inTunnelDNSPort is where a node's `dns` servers are asked. The setting names
+	// resolvers, not endpoints, so the port is always the DNS one.
+	inTunnelDNSPort = 53
+
+	// tunnelDNSTimeout bounds one in-tunnel resolver when the lookup itself has
+	// no deadline to share. It matches the budget the stack's own resolver
+	// allows a nameserver.
+	tunnelDNSTimeout = 5 * time.Second
+)
+
+// exchangeTunnel asks one in-tunnel resolver for both address families, over a
+// socket this call owns. Ownership is what makes the lookup cancellable: nothing
+// outside can end a read that is waiting on a silent nameserver, so a cancelled
+// context closes the socket.
+func (c *Client) exchangeTunnel(ctx context.Context, ns *netstack.Net, server netip.Addr, host string) ([]netip.Addr, error) {
+	conn, err := ns.DialUDPAddrPort(netip.AddrPort{}, netip.AddrPortFrom(server, inTunnelDNSPort))
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	// Both families are asked: which of the answers the peer can carry is
+	// tunnelCandidates' decision, not the resolver's.
+	var (
+		addrs   []netip.Addr
+		lastErr error
+	)
+	for _, qtype := range []uint16{mdns.TypeA, mdns.TypeAAAA} {
+		got, err := exchangeTunnelQuestion(conn, host, qtype)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		addrs = append(addrs, got...)
+	}
+	if len(addrs) > 0 {
+		return addrs, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no address")
+	}
+	return nil, lastErr
+}
+
+// exchangeTunnelQuestion sends one question on conn and collects the address
+// records of its answer.
+func exchangeTunnelQuestion(conn net.Conn, host string, qtype uint16) ([]netip.Addr, error) {
+	query := new(mdns.Msg)
+	query.SetQuestion(mdns.Fqdn(host), qtype)
+	wire, err := query.Pack()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Write(wire); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 1500)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return nil, err
+		}
+		var answer mdns.Msg
+		if err := answer.Unpack(buf[:n]); err != nil {
+			continue // not a DNS message; keep waiting for one we can read
+		}
+		if answer.Id != query.Id {
+			continue // a late answer to another question
+		}
+		if answer.Rcode != mdns.RcodeSuccess {
+			return nil, &net.DNSError{
+				Err:        mdns.RcodeToString[answer.Rcode],
+				Name:       host,
+				IsNotFound: answer.Rcode == mdns.RcodeNameError,
+			}
+		}
+		return tunnelAnswerAddrs(answer.Answer), nil
+	}
+}
+
+// tunnelAnswerAddrs collects the address records of one answer.
+func tunnelAnswerAddrs(records []mdns.RR) []netip.Addr {
+	out := make([]netip.Addr, 0, len(records))
+	for _, rr := range records {
+		switch record := rr.(type) {
+		case *mdns.A:
+			if ip, ok := netip.AddrFromSlice(record.A); ok {
+				out = append(out, ip.Unmap())
+			}
+		case *mdns.AAAA:
+			if ip, ok := netip.AddrFromSlice(record.AAAA); ok {
+				out = append(out, ip.Unmap())
+			}
+		}
+	}
+	return out
 }
 
 // familyConstraint is the address family a caller asked for with "tcp4" or

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -108,6 +109,8 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 	// connect to nothing (on device that shows up as "connected, this site does
 	// not load"). Dial the address the routing lookup produced instead. Proxied
 	// outbounds keep the name so the exit node stays the authority for DNS.
+	// A group answers this for the whole set of members it could use, so a group
+	// that mixes direct and proxied members answers "no" (see Group.DialsLocally).
 	dialsLocally := false
 	if ld, ok := ob.(outbound.LocalDialer); ok {
 		dialsLocally = ld.DialsLocally()
@@ -118,12 +121,31 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 		// the table altogether. A local dial has no such choice — it cannot dial
 		// a name that only exists inside our DNS — so the lookup happens here,
 		// once, and only for flows that actually go out directly.
-		if !lookedUp.IsValid() && resolve != nil {
-			_, _ = resolve()
+		var resolveErr error
+		if !lookedUp.IsValid() {
+			switch {
+			case resolve == nil:
+				resolveErr = errors.New("no resolver")
+			default:
+				if _, err := resolve(); err != nil {
+					resolveErr = err
+				}
+			}
 		}
-		if lookedUp.IsValid() {
-			target = netip.AddrPortFrom(lookedUp.Unmap(), port).String()
+		if !lookedUp.IsValid() {
+			// The fake address is useless to a local dial and the name is not an
+			// option either: handing it over would send it to the system
+			// resolver, which under fake-IP answers with the same placeholder —
+			// the connection then lands nowhere and the page fails silently.
+			// Fail here, with the reason, instead of pretending to have routed.
+			if resolveErr == nil {
+				resolveErr = errors.New("the resolver returned no address")
+			}
+			return nil, action, target, fmt.Errorf(
+				"%s: %s dials locally, so the fake address must be resolved on this device: %w",
+				target, ob.Tag(), resolveErr)
 		}
+		target = netip.AddrPortFrom(lookedUp.Unmap(), port).String()
 	}
 	return ob, action, target, nil
 }
@@ -134,12 +156,15 @@ func (e *Engine) resolveTarget(ctx context.Context, host string) (netip.AddrPort
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return netip.AddrPortFrom(ip, 0), nil
 	}
-	if e.resolver == nil {
+	e.mu.RLock()
+	resolver := e.resolver
+	e.mu.RUnlock()
+	if resolver == nil {
 		return netip.AddrPort{}, fmt.Errorf("no resolver for %q", host)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	addrs, err := e.resolver.Lookup(ctx, host)
+	addrs, err := resolver.Lookup(ctx, host)
 	if err != nil {
 		return netip.AddrPort{}, err
 	}

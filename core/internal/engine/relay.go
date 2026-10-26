@@ -126,11 +126,14 @@ type udpKey struct {
 func (e *Engine) HandleUDP(ctx context.Context, payload []byte, target, source string) ([]byte, error) {
 	// DNS hijack: anything aimed at :53 is answered locally through the
 	// resolver (which can itself detour over a proxy).
-	if e.resolver != nil {
+	e.mu.RLock()
+	resolver := e.resolver
+	e.mu.RUnlock()
+	if resolver != nil {
 		if _, port, err := net.SplitHostPort(target); err == nil && port == "53" {
 			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
-			return e.resolver.Exchange(rctx, payload)
+			return resolver.Exchange(rctx, payload)
 		}
 	}
 

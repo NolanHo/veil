@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -64,18 +65,19 @@ func (s *Supervisor) Call(ctx context.Context, method string, params json.RawMes
 		if err := decode(params, &p); err != nil {
 			return nil, err
 		}
-		s.mu.Lock()
-		if s.eng != nil {
-			s.mu.Unlock()
-			if err := s.eng.SetMode(p.Mode); err != nil {
-				return nil, err
-			}
-			s.mu.Lock()
+		// The mode is part of the stored configuration, so it leaves through the
+		// same door as every other write. Editing s.cfg and saving on the side
+		// put two writers on config.json at once (config.Save's fixed ".tmp"
+		// name then fails with "no such file or directory") and let memory and
+		// disk disagree. The engine's router is rebuilt by the reload inside
+		// commitConfig, which already applies cfg.Mode.
+		if err := s.commitConfig(func(cfg *config.Config) error {
+			cfg.Mode = p.Mode
+			return nil
+		}); err != nil {
+			return nil, err
 		}
-		s.cfg.Mode = p.Mode
-		cfg := s.cfg
-		s.mu.Unlock()
-		return s.Status(), s.persist(cfg)
+		return s.Status(), nil
 	case rpc.MethodSubAdd:
 		var p rpc.SubParams
 		if err := decode(params, &p); err != nil {
@@ -277,15 +279,14 @@ func (s *Supervisor) Select(p rpc.SelectParams) (any, error) {
 			return nil, err
 		}
 	}
-	s.mu.Lock()
-	for i := range s.cfg.Groups {
-		if s.cfg.Groups[i].Tag == p.Group {
-			s.cfg.Groups[i].Selected = p.Tag
+	if err := s.commitConfig(func(cfg *config.Config) error {
+		for i := range cfg.Groups {
+			if cfg.Groups[i].Tag == p.Group {
+				cfg.Groups[i].Selected = p.Tag
+			}
 		}
-	}
-	cfg := s.cfg
-	s.mu.Unlock()
-	if err := s.persist(cfg); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	return s.Groups(), nil
@@ -372,49 +373,39 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 		if nodes[i].Source == "" {
 			nodes[i].Source = source
 		}
+		res.Tags = append(res.Tags, nodes[i].Tag)
 	}
-	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
-	restore := s.snapshot()
-
-	added, updated := s.mergeNodes(nodes)
-	res.Added, res.Updated = added, updated
-	// Routing last, and per document in input order: mergeNodes appends new nodes
-	// to the generated groups, while a group a document curates replaces the
-	// stored one of the same tag. The counts are what the documents contributed,
-	// not the size of the resulting table.
-	//
-	// A pasted profile states a complete rule table, so it still owns it: its
-	// rules replace every stored rule, and they carry source so a later
-	// subscription refresh knows they are not its to replace.
-	origin := routingOrigin{Source: source, OwnsTable: true}
-	for _, t := range tables {
-		groups, rules, warnings := s.mergeRouting(t, origin)
-		res.Groups += groups
-		res.Rules += rules
-		for _, w := range warnings {
-			if len(res.Warnings) < maxImportWarnings {
-				res.Warnings = append(res.Warnings, w)
+	// The merge runs on the transaction's own copy of the configuration, so a
+	// rejected import cannot leave half of itself in the live config.
+	err := s.commitConfig(func(cfg *config.Config) error {
+		added, updated := mergeNodes(cfg, nodes)
+		res.Added, res.Updated = added, updated
+		// Routing last, and per document in input order: mergeNodes appends new
+		// nodes to the generated groups, while a group a document curates
+		// replaces the stored one of the same tag. The counts are what the
+		// documents contributed, not the size of the resulting table.
+		//
+		// A pasted profile states a complete rule table, so it still owns it: its
+		// rules replace every stored rule, and they carry source so a later
+		// subscription refresh knows they are not its to replace.
+		origin := routingOrigin{Source: source, OwnsTable: true}
+		for _, t := range tables {
+			groups, rules, warnings := mergeRoutingTable(cfg, t, origin)
+			res.Groups += groups
+			res.Rules += rules
+			for _, w := range warnings {
+				if len(res.Warnings) < maxImportWarnings {
+					res.Warnings = append(res.Warnings, w)
+				}
 			}
 		}
-	}
-	s.mu.Lock()
-	for _, n := range nodes {
-		res.Tags = append(res.Tags, n.Tag)
-	}
-	cfg := s.cfg
-	s.mu.Unlock()
-	if err := s.persist(cfg); err != nil {
-		// The merge already touched the live config; put it back so a rejected
-		// import cannot poison every later write.
-		s.restore(restore)
-		return res, err
-	}
-	if err := s.reload(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return res, err
 	}
 	s.log.Infof("imported %d new and %d updated node(s), %d group(s), %d rule(s)",
-		added, updated, res.Groups, res.Rules)
+		res.Added, res.Updated, res.Groups, res.Rules)
 	return res, nil
 }
 
@@ -425,32 +416,31 @@ const (
 	maxImportWarnings = 20
 )
 
-// mergeNodes inserts or replaces nodes by tag and ensures a default group.
-func (s *Supervisor) mergeNodes(nodes []config.Node) (added, updated int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	idx := make(map[string]int, len(s.cfg.Nodes))
-	for i, n := range s.cfg.Nodes {
+// mergeNodes inserts or replaces nodes by tag and ensures a default group. It
+// edits cfg, which is the transaction's private copy (see commitConfig).
+func mergeNodes(cfg *config.Config, nodes []config.Node) (added, updated int) {
+	idx := make(map[string]int, len(cfg.Nodes))
+	for i, n := range cfg.Nodes {
 		idx[n.Tag] = i
 	}
 	for _, n := range nodes {
 		if i, ok := idx[n.Tag]; ok {
-			s.cfg.Nodes[i] = n
+			cfg.Nodes[i] = n
 			updated++
 			continue
 		}
-		idx[n.Tag] = len(s.cfg.Nodes)
-		s.cfg.Nodes = append(s.cfg.Nodes, n)
+		idx[n.Tag] = len(cfg.Nodes)
+		cfg.Nodes = append(cfg.Nodes, n)
 		added++
 	}
 	// Keep one generated "proxy" select group containing every node, unless the
 	// user or an imported profile already defined groups.
-	if len(s.cfg.Groups) == 0 {
-		tags := make([]string, 0, len(s.cfg.Nodes))
-		for _, n := range s.cfg.Nodes {
+	if len(cfg.Groups) == 0 {
+		tags := make([]string, 0, len(cfg.Nodes))
+		for _, n := range cfg.Nodes {
 			tags = append(tags, n.Tag)
 		}
-		s.cfg.Groups = []config.Group{{
+		cfg.Groups = []config.Group{{
 			Tag:     config.AutoGroupTag,
 			Type:    "select",
 			Auto:    true,
@@ -463,13 +453,13 @@ func (s *Supervisor) mergeNodes(nodes []config.Node) (added, updated int) {
 	// the routing decision — a fallback group listing [reject] must keep sending
 	// traffic to reject, and a url-test group listing two nodes must not start
 	// testing a third because a link was pasted later.
-	for gi := range s.cfg.Groups {
-		if !s.cfg.Groups[gi].Auto {
+	for gi := range cfg.Groups {
+		if !cfg.Groups[gi].Auto {
 			continue
 		}
 		for _, n := range nodes {
-			if !contains(s.cfg.Groups[gi].Members, n.Tag) {
-				s.cfg.Groups[gi].Members = append(s.cfg.Groups[gi].Members, n.Tag)
+			if !contains(cfg.Groups[gi].Members, n.Tag) {
+				cfg.Groups[gi].Members = append(cfg.Groups[gi].Members, n.Tag)
 			}
 		}
 	}
@@ -485,11 +475,10 @@ func contains(list []string, v string) bool {
 	return false
 }
 
-// Delete removes a manually added node.
 // snapshot copies the live configuration deeply enough that a mutation can be
 // validated before it becomes visible. Editing s.cfg in place and validating
-// only inside persist() left memory and disk disagreeing whenever validation
-// failed, and every later write then failed with the same error until the user
+// only afterwards left memory and disk disagreeing whenever validation failed,
+// and every later write then failed with the same error until the user
 // reimported a profile.
 func (s *Supervisor) snapshot() config.Config {
 	s.mu.Lock()
@@ -506,76 +495,136 @@ func (s *Supervisor) snapshot() config.Config {
 	return cfg
 }
 
-// restore puts a snapshot back after a rejected write. The caller holds cfgMu.
-func (s *Supervisor) restore(cfg config.Config) {
+// commitConfig is the one door every configuration write goes through.
+//
+// It holds cfgMu across the whole read-modify-write, which is what keeps the
+// writers apart: two callers editing the live configuration and saving on the
+// side both wrote the same "config.json.tmp" and one rename then failed with
+// "no such file or directory", while memory kept a mix of the two. The mutation
+// runs on the transaction's own copy, so a rejected change (an invalid tag, a
+// save that fails) leaves both the live configuration and the file untouched;
+// only a validated change is written and then published.
+//
+// The engine is updated inside the lock as well: a reload that ran after the
+// lock was released could apply an older snapshot than a writer that committed
+// in between, leaving the engine routing by a table nobody else has.
+func (s *Supervisor) commitConfig(mutate func(*config.Config) error) error {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	cfg := s.snapshot()
+	if mutate != nil {
+		if err := mutate(&cfg); err != nil {
+			return err
+		}
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := config.Save(s.cfgPath, cfg); err != nil {
+		return err
+	}
 	s.mu.Lock()
+	prev := s.cfg
 	s.cfg = cfg
+	eng := s.eng
 	s.mu.Unlock()
+	if eng == nil {
+		return nil
+	}
+	// A mode switch changes nothing the data path is built from — no outbound,
+	// group, rule or resolver differs — so the engine takes it through SetMode,
+	// which rebuilds only the matcher. Everything else rebuilds the data path.
+	if modeOnlyChange(prev, cfg) {
+		return eng.SetMode(cfg.Mode)
+	}
+	return eng.Reload(cfg)
+}
+
+// modeOnlyChange reports whether two configurations differ in nothing but the
+// mode, which is the one writer the engine can apply without a rebuild.
+func modeOnlyChange(a, b config.Config) bool {
+	a.Mode, b.Mode = "", ""
+	return reflect.DeepEqual(a, b)
 }
 
 // pruneRouting drops references to tags that no longer exist (a deleted node,
 // a node renamed by a subscription refresh) and groups left empty. Without this
 // a single delete makes the whole configuration invalid, which the UI can only
 // recover from by reimporting.
+//
+// Groups depend on each other, so one pass is not enough: deleting a node empties
+// the group that held it, and the group above it is left naming a tag that no
+// longer exists. Each round removes what is already gone — first group members
+// that name nothing, then the groups left without a member, then the rules that
+// addressed them — and the loop repeats until a round changes nothing. Every
+// removal strictly shrinks the configuration, so it settles.
 func pruneRouting(cfg *config.Config) {
-	known := make(map[string]bool, len(cfg.Nodes)+len(cfg.Groups)+2)
-	for _, n := range cfg.Nodes {
-		known[n.Tag] = true
-	}
-	for _, g := range cfg.Groups {
-		known[g.Tag] = true
-	}
-	known["direct"] = true
-	known["reject"] = true
-	for gi := range cfg.Groups {
-		members := make([]string, 0, len(cfg.Groups[gi].Members))
-		for _, m := range cfg.Groups[gi].Members {
-			if known[m] {
-				members = append(members, m)
+	for {
+		known := make(map[string]bool, len(cfg.Nodes)+len(cfg.Groups)+2)
+		for _, n := range cfg.Nodes {
+			known[n.Tag] = true
+		}
+		for _, g := range cfg.Groups {
+			known[g.Tag] = true
+		}
+		known["direct"] = true
+		known["reject"] = true
+		changed := false
+		for gi := range cfg.Groups {
+			members := make([]string, 0, len(cfg.Groups[gi].Members))
+			for _, m := range cfg.Groups[gi].Members {
+				if known[m] {
+					members = append(members, m)
+					continue
+				}
+				changed = true
 			}
+			cfg.Groups[gi].Members = members
 		}
-		cfg.Groups[gi].Members = members
-	}
-	groups := make([]config.Group, 0, len(cfg.Groups))
-	for _, g := range cfg.Groups {
-		if len(g.Members) > 0 {
-			groups = append(groups, g)
+		groups := make([]config.Group, 0, len(cfg.Groups))
+		for _, g := range cfg.Groups {
+			if len(g.Members) > 0 {
+				groups = append(groups, g)
+				continue
+			}
+			changed = true
+		}
+		cfg.Groups = groups
+		rules := make([]config.Rule, 0, len(cfg.Rules))
+		for _, r := range cfg.Rules {
+			if r.Action == "" || known[r.Action] {
+				rules = append(rules, r)
+				continue
+			}
+			changed = true
+		}
+		cfg.Rules = rules
+		if !changed {
+			return
 		}
 	}
-	cfg.Groups = groups
-	rules := make([]config.Rule, 0, len(cfg.Rules))
-	for _, r := range cfg.Rules {
-		if r.Action == "" || known[r.Action] {
-			rules = append(rules, r)
-		}
-	}
-	cfg.Rules = rules
 }
 
 func (s *Supervisor) Delete(tag string) error {
-	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
-	cfg := s.snapshot()
-	out := make([]config.Node, 0, len(cfg.Nodes))
-	found := false
-	for _, n := range cfg.Nodes {
-		if n.Tag == tag {
-			found = true
-			continue
+	return s.commitConfig(func(cfg *config.Config) error {
+		out := make([]config.Node, 0, len(cfg.Nodes))
+		found := false
+		for _, n := range cfg.Nodes {
+			if n.Tag == tag {
+				found = true
+				continue
+			}
+			out = append(out, n)
 		}
-		out = append(out, n)
-	}
-	if !found {
-		return fmt.Errorf("node %q not found", tag)
-	}
-	cfg.Nodes = out
-	// Rules and group members that pointed at this node die with it; keeping
-	// them would make the whole configuration invalid.
-	pruneRouting(&cfg)
-	if err := s.persist(cfg); err != nil {
-		return err
-	}
-	return s.reload()
+		if !found {
+			return fmt.Errorf("node %q not found", tag)
+		}
+		cfg.Nodes = out
+		// Rules and group members that pointed at this node die with it; keeping
+		// them would make the whole configuration invalid.
+		pruneRouting(cfg)
+		return nil
+	})
 }
 
 // SetConfig replaces the whole configuration.
@@ -589,17 +638,11 @@ func (s *Supervisor) SetConfig(cfg config.Config) (state.Status, error) {
 	if err := cfg.Validate(); err != nil {
 		return s.Status(), err
 	}
-	s.mu.Lock()
-	s.cfg = cfg
-	running := s.eng != nil
-	s.mu.Unlock()
-	if err := s.persist(cfg); err != nil {
+	if err := s.commitConfig(func(cur *config.Config) error {
+		*cur = cfg
+		return nil
+	}); err != nil {
 		return s.Status(), err
-	}
-	if running {
-		if err := s.reload(); err != nil {
-			return s.Status(), err
-		}
 	}
 	if lvl := cfg.LogLevel; lvl != "" {
 		s.log.SetLevel(logLevel(lvl))
@@ -616,21 +659,19 @@ func (s *Supervisor) addSubscription(p rpc.SubParams) (any, error) {
 	if name == "" {
 		name = p.URL
 	}
-	s.mu.Lock()
-	for _, sub := range s.cfg.Subscriptions {
-		if sub.URL == p.URL {
-			s.mu.Unlock()
-			return nil, fmt.Errorf("subscription already exists")
+	if err := s.commitConfig(func(cfg *config.Config) error {
+		for _, sub := range cfg.Subscriptions {
+			if sub.URL == p.URL {
+				return fmt.Errorf("subscription already exists")
+			}
 		}
-	}
-	s.cfg.Subscriptions = append(s.cfg.Subscriptions, config.Subscription{
-		Name:     name,
-		URL:      p.URL,
-		Interval: 86400,
-	})
-	cfg := s.cfg
-	s.mu.Unlock()
-	if err := s.persist(cfg); err != nil {
+		cfg.Subscriptions = append(cfg.Subscriptions, config.Subscription{
+			Name:     name,
+			URL:      p.URL,
+			Interval: 86400,
+		})
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	if _, err := s.updateSubscription(context.Background(), name); err != nil {
@@ -644,20 +685,22 @@ func (s *Supervisor) addSubscription(p rpc.SubParams) (any, error) {
 // them carries. Rows from other sources, and rows the user wrote (no source),
 // survive the refresh.
 func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]state.NodeStatus, error) {
-	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
+	// Read the address under the lock, then let go of it. The fetch used to run
+	// with cfgMu held, so a provider that took the full 25 seconds stopped every
+	// other configuration write for that long.
+	url := ""
 	s.mu.Lock()
-	var sub *config.Subscription
-	for i := range s.cfg.Subscriptions {
-		if s.cfg.Subscriptions[i].Name == name {
-			sub = &s.cfg.Subscriptions[i]
+	for _, sub := range s.cfg.Subscriptions {
+		if sub.Name == name {
+			url = sub.URL
+			break
 		}
 	}
 	s.mu.Unlock()
-	if sub == nil {
+	if url == "" {
 		return nil, fmt.Errorf("subscription %q not found", name)
 	}
-	fetched, err := s.fetchSubscription(sub.URL, name)
+	fetched, err := s.fetchSubscription(url, name)
 	if err != nil {
 		return nil, err
 	}
@@ -666,62 +709,93 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 		return nil, fmt.Errorf("subscription %q returned no nodes", name)
 	}
 
-	cfg := s.snapshot()
-	kept := make([]config.Node, 0, len(cfg.Nodes)+len(nodes))
-	for _, n := range cfg.Nodes {
-		if n.Source != name {
-			kept = append(kept, n)
+	var groups, rules int
+	err = s.commitConfig(func(cfg *config.Config) error {
+		// The fetch ran outside the lock, so the subscription may have been
+		// deleted or repointed meanwhile. The body speaks for the address it was
+		// fetched from: if that is no longer what this name holds, applying it
+		// would install nodes the user just asked to be rid of.
+		if err := stillSubscribedAt(cfg, name, url); err != nil {
+			return err
 		}
-	}
-	cfg.Nodes = append(kept, nodes...)
-	for i := range cfg.Subscriptions {
-		if cfg.Subscriptions[i].Name == name {
-			cfg.Subscriptions[i].Updated = time.Now().Unix()
-		}
-	}
-	// Rebuild group membership for the refreshed subscription: members that point
-	// at one of its nodes which is gone are dropped, and only the generated
-	// groups take the nodes that arrived. A curated group keeps the membership it
-	// was given — refreshing the node list must not move a fallback/url-test
-	// group's egress (see mergeNodes).
-	for gi := range cfg.Groups {
-		members := make([]string, 0, len(cfg.Groups[gi].Members)+len(nodes))
-		for _, m := range cfg.Groups[gi].Members {
-			if nodeSource(cfg.Nodes, m) != name || contains(tagsOf(nodes), m) {
-				members = append(members, m)
+		kept := make([]config.Node, 0, len(cfg.Nodes)+len(nodes))
+		for _, n := range cfg.Nodes {
+			if n.Source != name {
+				kept = append(kept, n)
 			}
 		}
-		if cfg.Groups[gi].Auto {
-			for _, n := range nodes {
-				if !contains(members, n.Tag) {
-					members = append(members, n.Tag)
+		cfg.Nodes = append(kept, nodes...)
+		for i := range cfg.Subscriptions {
+			if cfg.Subscriptions[i].Name == name {
+				cfg.Subscriptions[i].Updated = time.Now().Unix()
+			}
+		}
+		// The refresh speaks only for this subscription: mergeRoutingTable drops
+		// the groups and rules stamped with its name and merges the new ones, so
+		// a document that stopped defining a group or rule takes it along, while
+		// the user's own rows and every other source's stay.
+		//
+		// It runs before the prune below on purpose. mergeSourceRules places the
+		// fresh rows in the span the old ones occupied, and a prune that ran
+		// first could have emptied that span (a group whose only node was renamed
+		// takes its rules with it), dropping the block to the catch-all position
+		// — which moves the subscription's rules across the ones the user wrote
+		// and changes which of two rules for the same domain matches first.
+		var warnings []string
+		groups, rules, warnings = mergeRoutingTable(cfg, fetched.Routing, routingOrigin{Source: name})
+		for _, w := range warnings {
+			s.log.Warnf("subscription %s: %s", name, w)
+		}
+		// Rebuild group membership for the refreshed subscription: members that
+		// point at one of its nodes which is gone are dropped, and only the
+		// generated groups take the nodes that arrived. A curated group keeps the
+		// membership it was given — refreshing the node list must not move a
+		// fallback/url-test group's egress (see mergeNodes).
+		for gi := range cfg.Groups {
+			members := make([]string, 0, len(cfg.Groups[gi].Members)+len(nodes))
+			for _, m := range cfg.Groups[gi].Members {
+				if nodeSource(cfg.Nodes, m) != name || contains(tagsOf(nodes), m) {
+					members = append(members, m)
 				}
 			}
+			if cfg.Groups[gi].Auto {
+				for _, n := range nodes {
+					if !contains(members, n.Tag) {
+						members = append(members, n.Tag)
+					}
+				}
+			}
+			cfg.Groups[gi].Members = members
 		}
-		cfg.Groups[gi].Members = members
-	}
-	pruneRouting(&cfg)
-	// The refresh speaks only for this subscription: mergeRoutingTable drops the
-	// groups and rules stamped with its name and merges the new ones, so a
-	// document that stopped defining a group or rule takes it along, while the
-	// user's own rows and every other source's stay.
-	groups, rules, warnings := mergeRoutingTable(&cfg, fetched.Routing, routingOrigin{Source: name})
-	for _, w := range warnings {
-		s.log.Warnf("subscription %s: %s", name, w)
-	}
-	// Dropping one of the subscription's groups can leave another rule (one the
-	// user wrote) addressing a tag that no longer exists; validation would refuse
-	// the whole refresh, so the references go with the group.
-	pruneRouting(&cfg)
-	if err := s.persist(cfg); err != nil {
-		return nil, err
-	}
-	if err := s.reload(); err != nil {
+		// Dropping one of the subscription's groups can leave another rule (one
+		// the user wrote) addressing a tag that no longer exists, and emptying a
+		// group can strand the groups above it; validation would refuse the whole
+		// refresh, so the references go with what they pointed at.
+		pruneRouting(cfg)
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	s.log.Infof("subscription %s updated: %d node(s), %d group(s), %d rule(s)",
 		name, len(nodes), groups, rules)
 	return s.nodeStatuses(), nil
+}
+
+// stillSubscribedAt reports whether the configuration still holds this
+// subscription at the address a fetch was made from. It separates "the name
+// still means what was fetched" from "someone has moved on since".
+func stillSubscribedAt(cfg *config.Config, name, url string) error {
+	for _, sub := range cfg.Subscriptions {
+		if sub.Name != name {
+			continue
+		}
+		if sub.URL != url {
+			return fmt.Errorf("subscription %q was pointed at %q while it was being refreshed; refresh it again", name, sub.URL)
+		}
+		return nil
+	}
+	return fmt.Errorf("subscription %q was deleted while it was being refreshed", name)
 }
 
 func tagsOf(nodes []config.Node) []string {
@@ -742,51 +816,47 @@ func nodeSource(nodes []config.Node, tag string) string {
 }
 
 func (s *Supervisor) deleteSubscription(name string) error {
-	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
-	cfg := s.snapshot()
-	subs := make([]config.Subscription, 0, len(cfg.Subscriptions))
-	found := false
-	for _, sub := range cfg.Subscriptions {
-		if sub.Name == name {
-			found = true
-			continue
+	return s.commitConfig(func(cfg *config.Config) error {
+		subs := make([]config.Subscription, 0, len(cfg.Subscriptions))
+		found := false
+		for _, sub := range cfg.Subscriptions {
+			if sub.Name == name {
+				found = true
+				continue
+			}
+			subs = append(subs, sub)
 		}
-		subs = append(subs, sub)
-	}
-	if !found {
-		return fmt.Errorf("subscription %q not found", name)
-	}
-	cfg.Subscriptions = subs
-	nodes := make([]config.Node, 0, len(cfg.Nodes))
-	for _, n := range cfg.Nodes {
-		if n.Source != name {
-			nodes = append(nodes, n)
+		if !found {
+			return fmt.Errorf("subscription %q not found", name)
 		}
-	}
-	cfg.Nodes = nodes
-	// The groups and rules the subscription brought go with it. Rows without its
-	// name were written by the user or came from another document and are not
-	// this delete's to remove.
-	groups := make([]config.Group, 0, len(cfg.Groups))
-	for _, g := range cfg.Groups {
-		if g.Source != name {
-			groups = append(groups, g)
+		cfg.Subscriptions = subs
+		nodes := make([]config.Node, 0, len(cfg.Nodes))
+		for _, n := range cfg.Nodes {
+			if n.Source != name {
+				nodes = append(nodes, n)
+			}
 		}
-	}
-	cfg.Groups = groups
-	rules := make([]config.Rule, 0, len(cfg.Rules))
-	for _, r := range cfg.Rules {
-		if r.Source != name {
-			rules = append(rules, r)
+		cfg.Nodes = nodes
+		// The groups and rules the subscription brought go with it. Rows without
+		// its name were written by the user or came from another document and are
+		// not this delete's to remove.
+		groups := make([]config.Group, 0, len(cfg.Groups))
+		for _, g := range cfg.Groups {
+			if g.Source != name {
+				groups = append(groups, g)
+			}
 		}
-	}
-	cfg.Rules = rules
-	pruneRouting(&cfg)
-	if err := s.persist(cfg); err != nil {
-		return err
-	}
-	return s.reload()
+		cfg.Groups = groups
+		rules := make([]config.Rule, 0, len(cfg.Rules))
+		for _, r := range cfg.Rules {
+			if r.Source != name {
+				rules = append(rules, r)
+			}
+		}
+		cfg.Rules = rules
+		pruneRouting(cfg)
+		return nil
+	})
 }
 
 // subscriptionBody is one fetched subscription: the nodes it lists and, when the
@@ -855,15 +925,4 @@ func decodeBase64(body []byte) []byte {
 		}
 	}
 	return nil
-}
-
-// persist writes the configuration atomically.
-func (s *Supervisor) persist(cfg config.Config) error {
-	if err := cfg.Validate(); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.cfg = cfg
-	s.mu.Unlock()
-	return config.Save(s.cfgPath, cfg)
 }

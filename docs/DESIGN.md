@@ -106,7 +106,27 @@ lookup: a local dial has no exit node to resolve for it, and handing it the
 fake address (or a name that only exists inside our DNS) connects to nothing.
 So when the walk produced no address and the chosen outbound dials locally, the
 router resolves once more, at the dial — the same lookup, from the same cache,
-bounded the same way.
+bounded the same way. If that lookup fails too, the decision fails with the
+reason it failed ("… dials locally, so the fake address must be resolved on this
+device: …"). It is not handed the hostname: a local dial would pass the name to
+the system resolver, under fake-IP that answers with the same placeholder, and
+the connection dies somewhere the user cannot see. A proxied outbound keeps the
+name in every case — the exit node stays the authority for DNS.
+
+Whether an outbound dials locally is a group-level question, and groups answer it
+conservatively: `Group.DialsLocally` is true only when *every* member the group
+could use dials locally. A fallback or load-balance member is chosen at dial
+time and a url-test group switches on its own, so answering for `current` would
+substitute an address into flows that end up at a proxy member, costing the
+remote resolution the proxy exists for. The price is the mirror image: a group
+that mixes a direct and a proxied member answers false, so a fake-IP flow that
+lands on the direct member of such a group (a "select" group pinned to DIRECT,
+say) keeps its name and that local dial is back to asking the system resolver —
+the failure this section opened with. The group cannot tell which member carries
+a given connection, so it cannot answer more precisely than "all of them";
+answering per group type (select answers for `current`, the others for every
+member) would keep the pinned case working and is the alternative if this
+trade-off is ever reversed.
 
 `no-resolve` is honoured in both directions. Such a rule never makes the router
 resolve, and it never matches an address the router looked up — it only sees a
@@ -133,8 +153,13 @@ routes those flows with the rest of its table.
   connections and asserts that goroutines return to the baseline and that the
   registry is empty.
 - A url-test or fallback group arms its probe loop on the first connection that
-  dials through it, not at startup: an imported group nobody uses must not wake
-  the device every interval.
+  dials through it — TCP or UDP, since a QUIC/DoH-only group is in use just as
+  much — not at startup: an imported group nobody uses must not wake the device
+  every interval. A dial the engine makes for itself (the outbound self-check,
+  a member probe, a UI latency measurement) is marked internal and does not arm
+  anything, so "connected and idle" really is zero wakeups. A group the engine
+  has stopped — `Stop`, or a reload that replaced it — stays stopped; a
+  connection already routed to it cannot resurrect its loop.
 - Measured on the device (MatePad Mini, tunnel up and idle for 61 s, no traffic):
   0.00 % of one core across `com.nolanho.kitsune` and its `:vpn` process, two
   log lines. The watchdog ticks every 5 s but only logs when the status actually

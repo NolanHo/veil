@@ -34,6 +34,11 @@ type PacketConn interface {
 // on this device (the built-in direct), as opposed to proxies that hand the
 // name to the exit node. The router uses it to avoid handing a fake address
 // from the local DNS to a dial that would resolve it again.
+//
+// A policy group implements it too, and conservatively: it answers true only
+// when every member it could use dials locally, because the member that ends up
+// dialing is chosen at dial time and the router must not substitute an address
+// into a flow that a proxy carries. See engine.Group.DialsLocally.
 type LocalDialer interface {
 	DialsLocally() bool
 }

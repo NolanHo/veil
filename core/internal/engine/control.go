@@ -28,6 +28,9 @@ func (e *Engine) Reload(cfg config.Config) error {
 		e.mu.Unlock()
 		return nil
 	}
+	// Read under the lock: a group built below records it as the probe loop's
+	// parent, and that context belongs to this engine.
+	parent := e.ctx
 	e.mu.Unlock()
 
 	// Build the replacement set outside the lock.
@@ -52,6 +55,10 @@ func (e *Engine) Reload(cfg config.Config) error {
 			buildErrs = append(buildErrs, fmt.Sprintf("group %s: %v", g.Tag, err))
 			continue
 		}
+		// Same parent as the engine: the group is published below and any dial
+		// that reaches it must arm a loop this engine can still cancel. A group
+		// retired by this reload is stopped and cannot be armed again.
+		grp.setParent(parent)
 		obs[g.Tag] = grp
 		groups = append(groups, grp)
 	}
@@ -96,19 +103,30 @@ func (e *Engine) Reload(cfg config.Config) error {
 
 	var resolver *dns.Resolver
 	if cfg.DNS.Enable {
-		r, err := dns.New(cfg.DNS, e.log)
+		// The pool belongs to the engine, not to the resolver: a reload builds a
+		// new resolver but must not build a second allocator. A pool seeded from a
+		// copy of the old mappings would still be free to hand the next unused
+		// address to a different name, so a client that kept dialling an address
+		// from before the reload would be routed under the wrong domain.
+		e.mu.RLock()
+		prev := e.resolver
+		e.mu.RUnlock()
+		r, err := dns.NewWithPool(cfg.DNS, e.log, e.routeCache.fakePool(prev))
 		if err != nil {
 			closeAll(obs)
 			return fmt.Errorf("dns: %w", err)
 		}
 		r.SetDial(e.dnsDial)
-		// The device keeps using the addresses the previous pool handed out;
-		// without this they arrive as bare 198.18.x.x destinations.
-		e.mu.RLock()
-		prev := e.resolver
-		e.mu.RUnlock()
-		r.AdoptFakeIPs(prev)
 		resolver = r
+	}
+
+	// One generation per reload. The routing cache is namespaced by it, so the
+	// answers and the in-flight lookups that belong to the outgoing resolver are
+	// unreachable from the configuration about to go live, and none of them can
+	// be stored under the new one.
+	gen := e.routeCache.advance()
+	if resolver != nil {
+		resolver.SetGeneration(gen)
 	}
 
 	// Swap.
@@ -247,7 +265,9 @@ func (e *Engine) ProbeTag(tag string) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return probeHTTP(ctx, ob, defaultProbeURL, 6*time.Second)
+	// A latency measurement is engine-internal: it must not arm a url-test
+	// group's probe loop just because the UI asked how fast a node is.
+	return probeHTTPInternal(ctx, ob, defaultProbeURL, 6*time.Second)
 }
 
 // ProbeAll measures every node concurrently, capped at four at a time.
@@ -274,7 +294,7 @@ func (e *Engine) ProbeAll() map[string]int {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			ms, err := probeHTTP(ctx, ob, defaultProbeURL, 6*time.Second)
+			ms, err := probeHTTPInternal(ctx, ob, defaultProbeURL, 6*time.Second)
 			mu.Lock()
 			if err != nil {
 				out[tag] = -1

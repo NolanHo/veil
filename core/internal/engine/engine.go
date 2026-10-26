@@ -134,6 +134,9 @@ func (e *Engine) Start(ctx context.Context, tunFD int) error {
 			e.log.Errorf("group %s failed: %v", g.Tag, err)
 			continue
 		}
+		// The probe loop a later dial arms must die with this engine, so the
+		// parent is fixed here, before anything can reach the group.
+		grp.setParent(e.ctx)
 		e.outbounds[g.Tag] = grp
 		e.groups = append(e.groups, grp)
 	}
@@ -146,7 +149,7 @@ func (e *Engine) Start(ctx context.Context, tunFD int) error {
 		}
 	}
 	e.defaultTag = final
-	e.defaultOB = e.resolveTag(final)
+	e.defaultOB = e.resolveTagLocked(final)
 	if e.defaultOB == nil {
 		// No explicit final: prefer the first select group, then the first node.
 		for _, g := range e.groups {
@@ -179,7 +182,9 @@ func (e *Engine) Start(ctx context.Context, tunFD int) error {
 
 	// 3. DNS.
 	if e.cfg.DNS.Enable {
-		r, err := dns.New(e.cfg.DNS, e.log)
+		// Share the engine's pool: a restart must not orphan the addresses
+		// applications still hold from before it.
+		r, err := dns.NewWithPool(e.cfg.DNS, e.log, e.routeCache.fakePool(nil))
 		if err != nil {
 			e.log.Errorf("dns disabled: %v", err)
 		} else {
@@ -227,6 +232,10 @@ func (e *Engine) Start(ctx context.Context, tunFD int) error {
 	// 6. Outbound self-check: prove the selected node can actually reach a
 	// domestic and a foreign endpoint, and say so in the log. Without this the
 	// user sees "connected" and a broken page with no explanation.
+	//
+	// The dial is marked engine-internal: it goes through the default outbound,
+	// which may be a url-test group, and a self-check is not user traffic — it
+	// must not arm that group's probe loop (AGENTS.md invariant 7).
 	if e.defaultOB != nil {
 		ob := e.defaultOB
 		go func() {
@@ -235,7 +244,7 @@ func (e *Engine) Start(ctx context.Context, tunFD int) error {
 				{"foreign", "http://www.gstatic.com/generate_204"},
 				{"foreign-tls", "https://www.google.com/generate_204"},
 			} {
-				ms, perr := probeHTTP(e.ctx, ob, probe.url, 10*time.Second)
+				ms, perr := probeHTTPInternal(e.ctx, ob, probe.url, 10*time.Second)
 				if perr != nil {
 					e.log.Warnf("出站自检 %s 失败 (%s): %v", probe.name, ob.Tag(), perr)
 				} else {
@@ -246,10 +255,11 @@ func (e *Engine) Start(ctx context.Context, tunFD int) error {
 	}
 
 	// 7. Group probes (running connections; no periodic wakeups when idle).
-	// Probe loops are armed by the first connection that uses a group, not
-	// here: a url-test group nobody dials through has no business waking the
-	// device every interval (AGENTS.md invariant 7).
-	_ = e.groups
+	// A probe loop is armed by the first TCP or UDP connection routed through a
+	// group, and only by user traffic: the self-check above and the group's own
+	// probes are marked internal and leave an unused group asleep. A group the
+	// engine no longer owns (stopped, or replaced by a reload) cannot be armed
+	// again — see Group.start.
 
 	e.running = true
 	return nil
@@ -268,10 +278,22 @@ func (e *Engine) resolveTag(tag string) outbound.Outbound {
 	if tag == "" {
 		return nil
 	}
-	if ob, ok := e.outbounds[tag]; ok {
-		return ob
+	// Reload swaps the map under e.mu; a rule matched on the data path reads it
+	// here, so the read needs the same lock the write holds.
+	e.mu.RLock()
+	ob := e.outbounds[tag]
+	e.mu.RUnlock()
+	return ob
+}
+
+// resolveTagLocked is resolveTag for callers that already hold e.mu: the
+// RWMutex is not reentrant, so Start (which builds the map under the write
+// lock) must not call the locking form.
+func (e *Engine) resolveTagLocked(tag string) outbound.Outbound {
+	if tag == "" {
+		return nil
 	}
-	return nil
+	return e.outbounds[tag]
 }
 
 // Stop tears everything down and waits for handlers to finish.

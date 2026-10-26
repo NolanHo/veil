@@ -202,7 +202,14 @@ func dedupeKey(n config.Node) string {
 	}
 	var tlsPart string
 	if n.TLS != nil {
-		tlsPart = strconv.FormatBool(n.TLS.Enabled) + "|" + n.TLS.ServerName
+		// Everything that decides who the peer is authenticated as, or how the
+		// handshake is spelled, belongs here: the certificate pin alone can point
+		// two entries at the same endpoint with different certificates, and
+		// merging them would send every group that names the second one to a peer
+		// its pin rejects. Insecure, the server name and ALPN change the same
+		// negotiation.
+		tlsPart = strconv.FormatBool(n.TLS.Enabled) + "|" + strconv.FormatBool(n.TLS.Insecure) + "|" +
+			n.TLS.ServerName + "|" + strings.Join(n.TLS.ALPN, ",") + "|" + n.TLS.Fingerprint
 		if n.TLS.Reality != nil {
 			tlsPart += "|" + n.TLS.Reality.PublicKey + "|" + n.TLS.Reality.ShortID
 		}

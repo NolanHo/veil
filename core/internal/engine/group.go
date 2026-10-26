@@ -29,13 +29,19 @@ type Group struct {
 
 	rr atomic.Uint64
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	// startOnce keeps a group from owning two probe loops when it is started
-	// both by the engine and, lazily, by the first connection that uses it.
-	startOnce sync.Once
-	parent    context.Context
+	// parent is the engine context the probe loop must die with. The engine
+	// records it once (setParent), before the group can be dialed; both that
+	// write and start's read happen under lifeMu, because the first connections
+	// that arm a group arrive concurrently.
+	parent context.Context
+
+	// lifeMu guards the probe-loop lifecycle. It is separate from mu so that
+	// stopping a group never queues behind a reader of current/delays.
+	lifeMu  sync.Mutex
+	armed   bool // a probe loop was launched; it is launched once
+	stopped bool // the group is gone for good; no dial re-arms it
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
 }
 
 type probe struct {
@@ -127,31 +133,73 @@ func newGroup(g config.Group, obs map[string]outbound.Outbound, nodes map[string
 	return grp, nil
 }
 
+// setParent records the context the probe loop derives from. The engine calls it
+// once, after newGroup and before the group is published to anything that can
+// dial, so the loop lives exactly as long as the engine that owns the group.
+func (g *Group) setParent(parent context.Context) {
+	g.lifeMu.Lock()
+	g.parent = parent
+	g.lifeMu.Unlock()
+}
+
 // Tag implements outbound.Outbound.
 func (g *Group) Tag() string { return g.cfg.Tag }
 
 // Type implements outbound.Outbound.
 func (g *Group) Type() string { return "group:" + g.cfg.Type }
 
-// DialContext implements outbound.Outbound.
-// DialsLocally reports whether the member this group would use resolves names
-// on this device, so the router knows a fake address must be replaced first.
+// DialsLocally reports whether this group resolves names on this device, so the
+// router knows a fake address must be replaced before the dial.
+//
+// Conservative on purpose: true only when every member the group could use dials
+// locally. `current` is not a promise about who carries this connection —
+// load-balance rotates, fallback and url-test pick at dial time — so answering
+// for one member would substitute a real address into flows that then leave
+// through a proxy member, which costs exactly the remote DNS the proxy is
+// configured for.
+//
+// The trade-off is the under-substitution this answer cannot avoid: a group that
+// mixes a direct and a proxied member answers false, so a fake-IP flow that does
+// land on the direct member (a select group pinned to DIRECT) keeps its name and
+// that local dial asks the system resolver again, which is the failure mode the
+// router's substitution exists to prevent. Answering per group type — select
+// reports its `current` member, fallback/url-test/load-balance report all of them
+// — would keep that case working; this answers for the member set instead,
+// because even a select group's member can move between this decision and the
+// dial that follows it.
 func (g *Group) DialsLocally() bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	if g.current < 0 || g.current >= len(g.members) {
+	if len(g.members) == 0 {
 		return false
 	}
-	if ld, ok := g.members[g.current].(outbound.LocalDialer); ok {
-		return ld.DialsLocally()
+	// A select group dials exactly the member it reports, so its answer is the
+	// pinned member's answer — that includes the common "selector pinned to
+	// DIRECT" profile, which must still resolve the fake address locally.
+	// The other types pick per connection: url-test and fallback walk the list,
+	// load-balance rotates, so any of them may dial locally and the only safe
+	// answer is "yes" when they all do.
+	if g.cfg.Type == "select" {
+		if g.current < 0 || g.current >= len(g.members) {
+			return false
+		}
+		ld, ok := g.members[g.current].(outbound.LocalDialer)
+		return ok && ld.DialsLocally()
 	}
-	return false
+	for _, m := range g.members {
+		ld, ok := m.(outbound.LocalDialer)
+		if !ok || !ld.DialsLocally() {
+			return false
+		}
+	}
+	return true
 }
 
+// DialContext implements outbound.Outbound.
 func (g *Group) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	// First use arms the probe loop; the group is about to carry traffic, so
 	// keeping its member latencies fresh is now worth the wakeups.
-	g.start(g.parent)
+	g.armFrom(ctx)
 	switch g.cfg.Type {
 	case "fallback":
 		var lastErr error
@@ -186,6 +234,10 @@ func (g *Group) DialContext(ctx context.Context, network, address string) (net.C
 
 // DialPacket implements outbound.PacketOutbound when the active member does.
 func (g *Group) DialPacket(ctx context.Context, address string) (outbound.PacketConn, error) {
+	// UDP is the same "the group is carrying traffic" signal as TCP: a url-test
+	// group used only for QUIC or DoH never saw DialContext, so its members were
+	// never measured. Both paths arm exactly here.
+	g.armFrom(ctx)
 	ob := g.now()
 	p, ok := ob.(outbound.PacketOutbound)
 	if !ok {
@@ -219,24 +271,74 @@ func (g *Group) selectTag(tag string) error {
 	return fmt.Errorf("%q is not a member of %q", tag, g.cfg.Tag)
 }
 
+// internalDialKey marks a connection the engine opens for itself rather than for
+// the user: the outbound self-check at start, a member probe, ProbeTag. Such a
+// dial must not arm a group's probe loop — AGENTS.md invariant 7 allows periodic
+// wakeups only once the tunnel actually carries traffic, and the self-check runs
+// on every start, idle or not.
+type internalDialKey struct{}
+
+// withInternalDial marks ctx as belonging to an engine-internal dial.
+func withInternalDial(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, internalDialKey{}, true)
+}
+
+// isInternalDial reports whether ctx belongs to an engine-internal dial.
+func isInternalDial(ctx context.Context) bool {
+	return ctx != nil && ctx.Value(internalDialKey{}) != nil
+}
+
+// probeHTTPInternal is probeHTTP for a probe. The dial it performs is marked as
+// engine-internal, so a group it goes through does not start a probe loop of its
+// own. Every caller of probeHTTP in this package goes through here; delay.go
+// keeps the measurement itself.
+func probeHTTPInternal(ctx context.Context, ob outbound.Outbound, url string, timeout time.Duration) (int, error) {
+	return probeHTTP(withInternalDial(ctx), ob, url, timeout)
+}
+
+// armFrom starts the probe loop for a dial that is about to carry user traffic.
+// A probe or a self-check reaches a group through the same DialContext, but it
+// is not user traffic and must leave the group dormant.
+func (g *Group) armFrom(ctx context.Context) {
+	if isInternalDial(ctx) {
+		return
+	}
+	g.start()
+}
+
 // start launches the probe loop. Idempotent, and deferred until something
 // actually dials through a url-test/fallback group: an imported group that
 // nobody uses must not wake the device up every interval.
-func (g *Group) start(parent context.Context) {
+//
+// A stopped group never starts again. An engine Stop or a reload that replaced
+// the group cancels the context this loop derives from, so a dial that still
+// holds the old group (a connection already routed through it) would otherwise
+// create a loop nobody owns any more — it would outlive the engine and tick for
+// the rest of the process.
+func (g *Group) start() {
 	if g.cfg.Type != "url-test" && g.cfg.Type != "fallback" {
 		return
 	}
+	g.lifeMu.Lock()
+	defer g.lifeMu.Unlock()
+	if g.armed || g.stopped {
+		return
+	}
+	g.armed = true
+	parent := g.parent
 	if parent == nil {
 		parent = context.Background()
 	}
-	g.startOnce.Do(func() {
-		g.parent = parent
-		g.launchProbeLoop(parent)
-	})
+	g.launchProbeLoop(parent)
 }
 
+// launchProbeLoop starts the ticker goroutine; the caller holds lifeMu.
 func (g *Group) launchProbeLoop(parent context.Context) {
-	g.ctx, g.cancel = context.WithCancel(parent)
+	ctx, cancel := context.WithCancel(parent)
+	g.cancel = cancel
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
@@ -244,30 +346,38 @@ func (g *Group) launchProbeLoop(parent context.Context) {
 		if interval <= 0 {
 			interval = 5 * time.Minute
 		}
-		g.tick()
+		g.tick(ctx)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
-			case <-g.ctx.Done():
+			case <-ctx.Done():
 				return
 			case <-t.C:
-				g.tick()
+				g.tick(ctx)
 			}
 		}
 	}()
 }
 
+// stop ends the probe loop and forbids a later one. The stopped flag is
+// permanent: reload hands the retired group to connections that are still
+// unwinding, and those dials must not resurrect it.
 func (g *Group) stop() {
-	if g.cancel != nil {
-		g.cancel()
-		g.wg.Wait()
+	g.lifeMu.Lock()
+	g.stopped = true
+	cancel := g.cancel
+	g.cancel = nil
+	g.lifeMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
+	g.wg.Wait()
 }
 
 // tick probes every member and, for url-test, switches to the fastest healthy
 // one within the configured tolerance.
-func (g *Group) tick() {
+func (g *Group) tick(ctx context.Context) {
 	url := g.cfg.URL
 	if url == "" {
 		url = defaultProbeURL
@@ -286,7 +396,7 @@ func (g *Group) tick() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			ms, err := probeHTTP(g.ctx, m, url, 5*time.Second)
+			ms, err := probeHTTPInternal(ctx, m, url, 5*time.Second)
 			ch <- res{tag: m.Tag(), ms: ms, err: err}
 		}(m)
 	}
@@ -372,5 +482,7 @@ func (e *Engine) ProbeGroup(groupTag, memberTag string) (int, error) {
 	if target == nil {
 		return -1, fmt.Errorf("%q is not a member of %q", memberTag, groupTag)
 	}
-	return probeHTTP(e.ctx, target, defaultProbeURL, 5*time.Second)
+	// A member probe is engine-internal: if the member is itself a group, its own
+	// probe loop must not be armed by the parent's tick.
+	return probeHTTPInternal(e.ctx, target, defaultProbeURL, 5*time.Second)
 }
