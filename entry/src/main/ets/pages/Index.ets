@@ -112,7 +112,7 @@ struct Index {
   header() {
     Row() {
       Column({ space: 2 }) {
-        Text('Veil')
+        Text('Kitsune')
           .fontSize(20)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.veil_text'))

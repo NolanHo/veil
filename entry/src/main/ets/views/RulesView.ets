@@ -117,8 +117,13 @@ export struct RulesView {
     }
     try {
       const r: ImportResult = await CoreClient.get().importText(text);
+      // Old cores do not report group/rule counts; treat absent as 0 so the
+      // line never reads "分组 undefined".
+      const groups: number = r.groups === undefined ? 0 : r.groups;
+      const rules: number = r.rules === undefined ? 0 : r.rules;
       this.resultLine = '新增 ' + r.added.toString() + ' · 更新 ' + r.updated.toString() +
-        ' · 失败 ' + r.failed.toString();
+        ' · 失败 ' + r.failed.toString() + ' · 分组 ' + groups.toString() +
+        ' · 规则 ' + rules.toString();
       this.resultErrors = r.errors === undefined ? [] : r.errors;
       this.pasteText = '';
       await this.load();
@@ -265,13 +270,22 @@ export struct RulesView {
         Text(rule.type)
           .fontSize(10)
           .fontColor($r('app.color.veil_text_dim'))
-        Text(rule.value.length > 0 ? rule.value : '（任意）')
-          .fontSize(13)
-          .fontColor($r('app.color.veil_text'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
-          .textAlign(TextAlign.Start)
+        Row({ space: 6 }) {
+          Text(rule.value.length > 0 ? rule.value : '（任意）')
+            .fontSize(13)
+            .fontColor($r('app.color.veil_text'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+            .textAlign(TextAlign.Start)
+          if (rule.no_resolve === true) {
+            // A flag, not a routing decision: keep it quiet and out of the
+            // action colour so it reads as an annotation on the value.
+            Tag({ label: 'no-resolve', tone: this.dark ? '#8B94A5' : '#5B6474' })
+          }
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)

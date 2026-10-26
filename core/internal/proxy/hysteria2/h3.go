@@ -278,10 +278,10 @@ func readQPACKString(b []byte) (string, int, error) {
 func decodeFieldSection(b []byte) ([]headerField, error) {
 	// RFC 9204 §4.5.1: the Encoded Field Section Prefix comes first — Encoded
 	// Required Insert Count (8-bit prefix) then Delta Base (7-bit prefix and
-	// sign) — and has to be consumed before the field lines. With no dynamic
-	// table it is 0x00 0x00; without consuming it the first field line looked
-	// like a prefix and the prefix looked like "unsupported qpack
-	// representation 0x00".
+	// sign) — and has to be consumed before the field lines. Our encoder writes
+	// 0x00 0x00 (no dynamic table), but the prefix is not a constant on the
+	// decode side: a peer may carry any non-negative Base, and the sign bit is
+	// part of the field, not something to skip.
 	insertCount, n, err := readQPACKInt(b, 8)
 	if err != nil {
 		return nil, err
@@ -292,8 +292,20 @@ func decodeFieldSection(b []byte) ([]headerField, error) {
 		return nil, fmt.Errorf("hysteria2: qpack required insert count %d with an empty dynamic table", insertCount)
 	}
 	b = b[n:]
-	if _, n, err = readQPACKInt(b, 7); err != nil {
+	// RFC 9204 §4.5.1.2: Sign (one bit) then Delta Base (7-bit prefix).
+	// Base = Required Insert Count + Delta Base when Sign is 0 and
+	// Required Insert Count - Delta Base - 1 when Sign is 1. A negative Base is
+	// a protocol error: it names a dynamic-table insertion that cannot exist, so
+	// a section carrying one was not produced by a conforming encoder. The
+	// static table needs no Base at all, but a non-negative one stays legal.
+	deltaSign := len(b) > 0 && b[0]&0x80 != 0
+	deltaBase, n, err := readQPACKInt(b, 7)
+	if err != nil {
 		return nil, err
+	}
+	if deltaSign && deltaBase+1 > insertCount {
+		return nil, fmt.Errorf("hysteria2: qpack negative base (required insert count %d, delta base %d, sign 1)",
+			insertCount, deltaBase)
 	}
 	b = b[n:]
 

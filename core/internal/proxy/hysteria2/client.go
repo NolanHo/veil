@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +36,18 @@ const (
 
 // errClosed is returned once Close has been called.
 var errClosed = errors.New("hysteria2: client closed")
+
+// diagWire is the switch for the QUIC socket diagnostics: the datagram counters
+// and the wire details a failed dial reports. It exists because a device-session
+// handshake failure is otherwise indistinguishable between "nothing was sent"
+// (socket captured by the tun, no route), "sent, nothing came back" (server or
+// middlebox dropped us) and "something answered that is not the server".
+//
+// It is off by default and must stay that way: counting costs two atomics per
+// sent datagram and an atomic plus a mutex per received one, and wrapping the
+// socket hides ReadMsgUDP/WriteMsgUDP from quic-go, which then falls back to its
+// basic datagram path. VEIL_DIAG_HY2=1 turns it on for a debugging session.
+var diagWire = os.Getenv("VEIL_DIAG_HY2") == "1"
 
 // dialRefusedError means the server answered but refused the target. It is a
 // per-request failure, not a connection failure, so the QUIC connection is kept.
@@ -390,32 +403,23 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, *quic.Transport, net.Pac
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("hysteria2 %s: %w", c.tag, err)
 	}
-	// Raw counter sits under the obfs layer: comparing it with the outer counter
-	// is what tells "the server answered with obfuscated bytes we decoded into
-	// garbage" apart from "the server answered in plaintext".
-	raw := &countingConn{PacketConn: pkt}
-	pkt = raw
-	if c.obfs != nil {
-		// Obfuscation sits above the protected socket: every datagram QUIC puts
-		// on the wire is wrapped, and the fd was already handed to the protector.
-		pkt = newSalamanderConn(pkt, c.obfs)
-	}
-	// Count what the handshake actually put on the wire. Without this a failed
-	// dial on a device is indistinguishable between "nothing was sent" (socket
-	// captured by the tun, no route) and "sent, nothing came back" (server or
-	// middlebox dropped us), and both look like the same timeout.
-	counted := &countingConn{PacketConn: pkt}
-	pkt = counted
+	// Obfuscation sits above the protected socket: every datagram QUIC puts on
+	// the wire is wrapped, and the fd was already handed to the protector. The
+	// diagnostics switch adds the packet counters on top; see wrapDiag.
+	pkt, outer, raw := c.wrapDiag(pkt)
 
 	tr := &quic.Transport{Conn: pkt}
 	// quic-go wants an address for the transport; listen on the unspecified
 	// address of the same family as the server.
 	conn, err := tr.Dial(ctx, serverAddr, c.tlsConfig, c.quicConfig)
 	if err != nil {
+		var local net.Addr
+		if diagWire {
+			local = pkt.LocalAddr()
+		}
 		_ = tr.Close()
 		_ = pkt.Close()
-		return nil, nil, nil, fmt.Errorf("hysteria2 %s: quic dial %s: %w (local %s, wire %s, raw %s)",
-			c.tag, serverAddr, err, pkt.LocalAddr(), counted, raw)
+		return nil, nil, nil, c.dialError(serverAddr, local, outer, raw, err)
 	}
 	if err := c.authenticate(ctx, conn); err != nil {
 		_ = conn.CloseWithError(0, "")
@@ -426,8 +430,60 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, *quic.Transport, net.Pac
 	return conn, tr, pkt, nil
 }
 
+// wrapDiag turns the freshly opened socket into the one quic-go dials on.
+//
+// The obfs layer always applies — it is what the server speaks. The counting
+// shims exist only when diagWire is on, and then the raw counter sits under the
+// obfs layer: comparing it with the outer counter tells "the server answered
+// with obfuscated bytes we decoded into garbage" apart from "the server answered
+// in plaintext". With the switch off the socket comes back as it went in: no
+// wrapper, no allocation, no lock on the packet path.
+func (c *Client) wrapDiag(pkt net.PacketConn) (conn net.PacketConn, outer, raw *countingConn) {
+	if !diagWire {
+		if c.obfs != nil {
+			pkt = newSalamanderConn(pkt, c.obfs)
+		}
+		return pkt, nil, nil
+	}
+	if c.obfs != nil {
+		// Without obfs the two counters would tally exactly the same datagrams,
+		// so the raw one is only worth its wrapper when something sits between.
+		raw = &countingConn{PacketConn: pkt}
+		pkt = newSalamanderConn(raw, c.obfs)
+	}
+	outer = &countingConn{PacketConn: pkt}
+	return outer, outer, raw
+}
+
+// dialError reports a failed QUIC dial.
+//
+// The counters and the first datagram's source and leading bytes are diagnostics,
+// not error detail: they are attached only when diagWire is on, so an ordinary
+// log line never carries raw network bytes.
+func (c *Client) dialError(serverAddr, local net.Addr, outer, raw *countingConn, err error) error {
+	if !diagWire || outer == nil {
+		return fmt.Errorf("hysteria2 %s: quic dial %s: %w", c.tag, serverAddr, err)
+	}
+	localDesc := "unknown"
+	if local != nil {
+		localDesc = local.String()
+	}
+	return fmt.Errorf("hysteria2 %s: quic dial %s: %w (local %s, wire %s, raw %s)",
+		c.tag, serverAddr, err, localDesc, outer, rawOrUncounted(raw))
+}
+
+// rawOrUncounted renders the under-obfs counter, which only exists when the node
+// asks for obfs.
+func rawOrUncounted(raw *countingConn) string {
+	if raw == nil {
+		return "not counted (no obfs)"
+	}
+	return raw.String()
+}
+
 // countingConn tallies datagrams so a failed QUIC dial can report whether the
-// socket put anything on the wire at all.
+// socket put anything on the wire at all. It is a diagnostics shim: dial wraps a
+// socket with it only when diagWire is on.
 type countingConn struct {
 	net.PacketConn
 	sentPkts, sentBytes, recvPkts, recvBytes atomic.Int64

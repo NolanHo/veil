@@ -752,7 +752,7 @@ export struct SettingsView {
                   (this.dark ? '#8B94A5' : '#5B6474') })
               Hairline()
               Row() {
-                Text('Veil is a proxy client that tells the truth about its state.')
+                Text('Kitsune is a proxy client that tells the truth about its state.')
                   .fontSize(11)
                   .fontColor($r('app.color.veil_text_faint'))
                   .layoutWeight(1)

@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 
@@ -41,29 +40,11 @@ type wgServer struct {
 	port  int
 }
 
-// startWGServer brings a peer up and reports the UDP port it listens on.
+// startWGServer brings a peer up at the fixture's tunnel address and reports the
+// UDP port it listens on.
 func startWGServer(t *testing.T, serverPriv, clientPub string) *wgServer {
 	t.Helper()
-	tun, ns, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr(serverAddr)}, nil, tunnelMTU)
-	if err != nil {
-		t.Fatalf("create server stack: %v", err)
-	}
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "wgserver: "))
-	t.Cleanup(dev.Close)
-	conf := "private_key=" + mustHexKey(t, serverPriv) + "\n" +
-		"public_key=" + mustHexKey(t, clientPub) + "\n" +
-		"allowed_ip=" + clientAddr + "/32\n"
-	if err := dev.IpcSet(conf); err != nil {
-		t.Fatalf("server IpcSet: %v", err)
-	}
-	if err := dev.Up(); err != nil {
-		t.Fatalf("server up: %v", err)
-	}
-	uapi, err := dev.IpcGet()
-	if err != nil {
-		t.Fatalf("server IpcGet: %v", err)
-	}
-	return &wgServer{dev: dev, stack: ns, port: listenPort(t, uapi)}
+	return startWGServerAddrs(t, serverPriv, clientPub, []netip.Addr{netip.MustParseAddr(serverAddr)})
 }
 
 // listenPort reads the port the device's bind actually chose.
@@ -82,28 +63,12 @@ func listenPort(t *testing.T, uapi string) int {
 	return 0
 }
 
-// startTCPEcho runs a TCP echo server inside the peer's stack and reports its
-// port. Bytes written by the client must come back unchanged.
+// startTCPEcho runs a TCP echo server inside the peer's stack at the fixture's
+// tunnel address and reports its port. Bytes written by the client must come
+// back unchanged.
 func startTCPEcho(t *testing.T, ns *netstack.Net) int {
 	t.Helper()
-	ln, err := ns.ListenTCPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(serverAddr), 0))
-	if err != nil {
-		t.Fatalf("listen tcp in stack: %v", err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer c.Close()
-				_, _ = io.Copy(c, c)
-			}()
-		}
-	}()
-	return ln.Addr().(*net.TCPAddr).Port
+	return startTCPEchoAt(t, ns, netip.MustParseAddr(serverAddr))
 }
 
 // startUDPEcho runs a datagram echo server inside the peer's stack.

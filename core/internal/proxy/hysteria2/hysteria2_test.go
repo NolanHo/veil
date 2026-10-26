@@ -898,6 +898,52 @@ func TestDecodeFieldSectionConsumesPrefix(t *testing.T) {
 	}
 }
 
+// TestDecodeFieldSectionBaseSign is the QPACK negative-Base regression.
+//
+// RFC 9204 §4.5.1.2 makes the Delta Base field a sign bit followed by a 7-bit
+// integer, and Base = Required Insert Count + Delta Base when Sign is 0, or
+// Required Insert Count - Delta Base - 1 when Sign is 1. With a required insert
+// count of 0 and Sign 1 the Base is -1, which names a dynamic-table insertion
+// that cannot exist; a conforming encoder never emits it. The decoder used to
+// consume the 7-bit integer and ignore the sign bit, so 00 80 d9 was read as a
+// valid field section and decoded into ":status: 200".
+func TestDecodeFieldSectionBaseSign(t *testing.T) {
+	// 0xD9 is the indexed static field line for entry 25 (":status: 200").
+	const status200 = 0xD9
+
+	// Required Insert Count 0, Sign 1, Delta Base 0 → Base = -1.
+	if fields, err := decodeFieldSection([]byte{0x00, 0x80, status200}); err == nil {
+		t.Fatalf("a field section with Base = -1 was accepted and decoded into %+v", fields)
+	} else if !strings.Contains(err.Error(), "base") {
+		t.Fatalf("error %q does not name the invalid base", err)
+	}
+
+	// Base = 0 is the static-table case: no dynamic reference at all.
+	fields, err := decodeFieldSection([]byte{0x00, 0x00, status200})
+	if err != nil {
+		t.Fatalf("Base = 0: %v", err)
+	}
+	if len(fields) != 1 || fields[0] != (headerField{":status", "200"}) {
+		t.Fatalf("Base = 0 decoded %+v, want :status 200", fields)
+	}
+
+	// A non-zero, non-negative Base is legal as well: Sign 0 with Delta Base 64
+	// gives Base = 64. Treating the prefix as the constant 00 00 would reject it.
+	fields, err = decodeFieldSection([]byte{0x00, 0x40, status200})
+	if err != nil {
+		t.Fatalf("Base = 64: %v", err)
+	}
+	if len(fields) != 1 || fields[0] != (headerField{":status", "200"}) {
+		t.Fatalf("Base = 64 decoded %+v, want :status 200", fields)
+	}
+
+	// The prefix is still required: a section that stops after the required
+	// insert count has no Delta Base byte.
+	if _, err := decodeFieldSection([]byte{0x00}); err == nil {
+		t.Fatal("a field section without a Delta Base was accepted")
+	}
+}
+
 // TestHeaderValueIsCaseInsensitive pins the lookup of server headers: the wire
 // spells them lowercase, the package keeps hysteria's canonical spelling.
 func TestHeaderValueIsCaseInsensitive(t *testing.T) {

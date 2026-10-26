@@ -41,7 +41,7 @@ struct VeilCard {
 
         Blank()
 
-        Text('VEIL')
+        Text('KITSUNE')
           .fontSize(9)
           .fontColor('#475569')
           .letterSpacing(2)

@@ -57,11 +57,79 @@ var resolverDial = func(ctx context.Context, network, address string) (net.Conn,
 	return transport.NewDialer().DialContext(ctx, network, address)
 }
 
-// newEndpointResolver returns the resolver used for peer host names. PreferGo
-// keeps the Resolver.Dial hook in effect on every platform; the system resolver
-// would answer on sockets this process never sees.
-func newEndpointResolver() *net.Resolver {
-	return &net.Resolver{PreferGo: true, Dial: resolverDial}
+// newResolver returns the resolver used for peer host names and for dial targets
+// when the node has no in-tunnel resolver. PreferGo keeps the Resolver.Dial hook
+// in effect on every platform; the system resolver would answer on sockets this
+// process never sees.
+func (c *Client) newResolver() *net.Resolver {
+	return &net.Resolver{PreferGo: true, Dial: c.dialDNS}
+}
+
+// dialDNS is the resolver's Dial hook: it opens the query socket through the
+// protected dialer and hands it to the client for the length of the query.
+//
+// Registering it is what makes Close able to cancel a lookup: a resolver read
+// blocks until its own timeout even when the context passed to LookupNetIP is
+// cancelled (net.Resolver.exchange only derives the read deadline from it), so a
+// nameserver that never answers would keep a query alive well past Close.
+func (c *Client) dialDNS(ctx context.Context, network, address string) (net.Conn, error) {
+	conn, err := resolverDial(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	return c.trackDNS(conn)
+}
+
+// trackDNS registers a resolver socket so Close closes it.
+func (c *Client) trackDNS(conn net.Conn) (net.Conn, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		_ = conn.Close()
+		return nil, errClosed
+	}
+	c.dnsConns[conn] = struct{}{}
+	wrapped := &trackedConn{Conn: conn, c: c}
+	// The resolver takes its UDP path — and only that one — when the connection
+	// it dialed implements PacketConn. net.Dialer hands back a *net.UDPConn for
+	// "udp", which does; wrapping it has to keep that visible.
+	if pc, ok := conn.(net.PacketConn); ok {
+		return &trackedPacketConn{trackedConn: wrapped, pc: pc}, nil
+	}
+	return wrapped, nil
+}
+
+// forgetDNS drops a resolver socket from the client's registry.
+func (c *Client) forgetDNS(conn net.Conn) {
+	c.mu.Lock()
+	delete(c.dnsConns, conn)
+	c.mu.Unlock()
+}
+
+// trackedConn is a resolver connection that unregisters itself when the resolver
+// closes it, so a long-lived client does not accumulate dead sockets.
+type trackedConn struct {
+	net.Conn
+	c    *Client
+	once sync.Once
+}
+
+func (t *trackedConn) Close() error {
+	t.once.Do(func() { t.c.forgetDNS(t.Conn) })
+	return t.Conn.Close()
+}
+
+// trackedPacketConn keeps net.PacketConn visible through the registration
+// wrapper: without it net.Resolver frames the query as TCP.
+type trackedPacketConn struct {
+	*trackedConn
+	pc net.PacketConn
+}
+
+func (t *trackedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) { return t.pc.ReadFrom(p) }
+
+func (t *trackedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	return t.pc.WriteTo(p, addr)
 }
 
 // Client is one WireGuard peer. The device is created on the first dial and
@@ -86,6 +154,10 @@ type Client struct {
 	stack    *netstack.Net
 	closed   bool
 	closedCh chan struct{} // closed by Close; wakes a queued dial and stops a bring-up
+
+	// dnsConns are the resolver sockets this client has open, so Close can abort
+	// a lookup still waiting on a nameserver. Guarded by mu.
+	dnsConns map[net.Conn]struct{}
 }
 
 var (
@@ -128,7 +200,7 @@ func New(n config.Node) (*Client, error) {
 	if mtu <= 0 {
 		mtu = defaultMTU
 	}
-	return &Client{
+	c := &Client{
 		tag:        n.Tag,
 		endpoint:   n.Addr(),
 		privKey:    priv,
@@ -139,10 +211,12 @@ func New(n config.Node) (*Client, error) {
 		allowedIPs: allowed,
 		mtu:        mtu,
 		keepAlive:  n.KeepAlive,
-		resolver:   newEndpointResolver(),
 		dial:       make(chan struct{}, 1),
 		closedCh:   make(chan struct{}),
-	}, nil
+		dnsConns:   make(map[net.Conn]struct{}),
+	}
+	c.resolver = c.newResolver()
+	return c, nil
 }
 
 // Tag implements outbound.Outbound.
@@ -167,7 +241,18 @@ func (c *Client) Close() error {
 	close(c.closedCh)
 	dev := c.dev
 	c.dev, c.stack = nil, nil
+	// A name lookup is a live network operation of this client, and a resolver
+	// read only ends when its socket does. Close owns them: it returns with the
+	// queries gone, not with a goroutine still asking a dead nameserver.
+	queries := make([]net.Conn, 0, len(c.dnsConns))
+	for conn := range c.dnsConns {
+		queries = append(queries, conn)
+	}
+	clear(c.dnsConns)
 	c.mu.Unlock()
+	for _, conn := range queries {
+		_ = conn.Close()
+	}
 	if dev != nil {
 		dev.Close()
 	}
@@ -186,19 +271,54 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 		return nil, err
 	}
 	defer cancel()
+	// The whole dial hangs off the client, not just the bring-up: a target name
+	// is resolved outside the tunnel and that lookup can outlive its context, so
+	// Close has to be able to end it.
+	ctx, cancelClose := c.withClose(ctx)
+	defer cancelClose()
 	ns, err := c.getStack(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ap, err := c.tunnelAddr(ctx, ns, address)
+	return c.dialTCP(ctx, ns, network, address)
+}
+
+// dialTCP opens a stream to one of the addresses address resolves to.
+//
+// The requested address family is a hard constraint: the userspace stack builds
+// its socket from the address it is handed, so without the check below
+// DialContext(ctx, "tcp6", <IPv4 literal>) would return an IPv4 stream that
+// merely claimed to be v6.
+//
+// The candidates are tried in order. A name may answer with several addresses
+// while only one of them is reachable through the peer (the usual homelab name
+// publishes a v4 and a v6 address while allowed_ips covers one), and stopping at
+// the first was a failure the caller had no way to work around.
+func (c *Client) dialTCP(ctx context.Context, ns *netstack.Net, network, address string) (net.Conn, error) {
+	cands, err := c.tunnelCandidates(ctx, ns, address)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := ns.DialContextTCPAddrPort(ctx, ap)
-	if err != nil {
-		return nil, fmt.Errorf("wireguard %s: dial %s: %w", c.tag, ap, err)
+	family := familyOf(network)
+	var lastErr error
+	for _, ap := range cands {
+		if !family.allows(ap.Addr()) {
+			continue
+		}
+		conn, err := ns.DialContextTCPAddrPort(ctx, ap)
+		if err == nil {
+			return conn, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("wireguard %s: dial %s: %w", c.tag, address, ctxErr)
+		}
+		lastErr = err
 	}
-	return conn, nil
+	if lastErr != nil {
+		return nil, fmt.Errorf("wireguard %s: dial %s: %w", c.tag, address, lastErr)
+	}
+	return nil, fmt.Errorf("wireguard %s: dial %s: the peer carries no %s address for this destination (resolved %s)",
+		c.tag, address, family, addrPortList(cands))
 }
 
 // DialPacket opens a UDP association to address through the tunnel.
@@ -215,6 +335,8 @@ func (c *Client) DialPacket(ctx context.Context, address string) (outbound.Packe
 		return nil, err
 	}
 	defer cancel()
+	ctx, cancelClose := c.withClose(ctx)
+	defer cancelClose()
 	ns, err := c.getStack(ctx)
 	if err != nil {
 		return nil, err
@@ -426,7 +548,19 @@ func (c *Client) endpointAddr(ctx context.Context) (netip.AddrPort, error) {
 	return netip.AddrPortFrom(fallback, uint16(port)), nil
 }
 
-// tunnelAddr resolves a dial target and checks that the peer can carry it.
+// tunnelAddr resolves a dial target to the address a UDP association uses: the
+// first candidate the peer can carry.
+func (c *Client) tunnelAddr(ctx context.Context, ns *netstack.Net, address string) (netip.AddrPort, error) {
+	cands, err := c.tunnelCandidates(ctx, ns, address)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	return cands[0], nil
+}
+
+// tunnelCandidates resolves a dial target into every address the peer can carry,
+// in the order they should be tried: routable IPv4 first, then IPv6, each in
+// resolution order.
 //
 // Where the name is resolved depends on whether the node names a resolver, and
 // both halves matter:
@@ -439,24 +573,28 @@ func (c *Client) endpointAddr(ctx context.Context) (netip.AddrPort, error) {
 //     The userspace stack has no resolver in this case: asking it anyway fails
 //     every name with "cannot marshal DNS message", which is exactly how the
 //     outbound died on device.
-func (c *Client) tunnelAddr(ctx context.Context, ns *netstack.Net, address string) (netip.AddrPort, error) {
+func (c *Client) tunnelCandidates(ctx context.Context, ns *netstack.Net, address string) ([]netip.AddrPort, error) {
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
-		return netip.AddrPort{}, fmt.Errorf("wireguard %s: %w", c.tag, err)
+		return nil, fmt.Errorf("wireguard %s: %w", c.tag, err)
 	}
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
-		return netip.AddrPort{}, fmt.Errorf("wireguard %s: bad port %q", c.tag, portStr)
+		return nil, fmt.Errorf("wireguard %s: bad port %q", c.tag, portStr)
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
-		return c.routed(netip.AddrPortFrom(ip.Unmap(), uint16(port)))
+		ap, err := c.routed(netip.AddrPortFrom(ip.Unmap(), uint16(port)))
+		if err != nil {
+			return nil, err
+		}
+		return []netip.AddrPort{ap}, nil
 	}
 
 	var ips []netip.Addr
 	if len(c.dns) > 0 {
 		addrs, err := ns.LookupContextHost(ctx, host)
 		if err != nil {
-			return netip.AddrPort{}, fmt.Errorf("wireguard %s: resolve %s in tunnel: %w", c.tag, host, err)
+			return nil, fmt.Errorf("wireguard %s: resolve %s in tunnel: %w", c.tag, host, err)
 		}
 		for _, a := range addrs {
 			if ip, err := netip.ParseAddr(a); err == nil {
@@ -468,19 +606,19 @@ func (c *Client) tunnelAddr(ctx context.Context, ns *netstack.Net, address strin
 			// Say what to do about it: this node has no in-tunnel resolver, so the
 			// host resolver is the only path, and the remedy for a name only the
 			// peer side knows is to configure `dns` on the node.
-			return netip.AddrPort{}, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"wireguard %s: resolve %s outside the tunnel: %w (set this node's dns if only the peer side can resolve it)",
 				c.tag, host, err)
 		}
 	}
 
-	// Pick an address the peer can actually carry: a name may answer with both
-	// families while allowed_ips covers only one of them. IPv4 wins among the
-	// routable ones, because a homelab peer usually publishes both families but is
-	// only reachable over the v4 address.
+	// Pick the addresses the peer can actually carry: a name may answer with both
+	// families while allowed_ips covers only one of them. IPv4 comes first among
+	// the routable ones, because a homelab peer usually publishes both families
+	// but is only reachable over the v4 address.
 	var (
+		v4, v6   []netip.AddrPort
 		firstErr error
-		fallback netip.AddrPort
 	)
 	for _, ip := range ips {
 		ap, err := c.routed(netip.AddrPortFrom(ip.Unmap(), uint16(port)))
@@ -491,19 +629,69 @@ func (c *Client) tunnelAddr(ctx context.Context, ns *netstack.Net, address strin
 			continue
 		}
 		if ap.Addr().Is4() {
-			return ap, nil
+			v4 = append(v4, ap)
+			continue
 		}
-		if !fallback.IsValid() {
-			fallback = ap
+		v6 = append(v6, ap)
+	}
+	if len(v4)+len(v6) == 0 {
+		if firstErr != nil {
+			return nil, firstErr
 		}
+		return nil, fmt.Errorf("wireguard %s: resolve %s: no address", c.tag, host)
 	}
-	if fallback.IsValid() {
-		return fallback, nil
+	return append(v4, v6...), nil
+}
+
+// familyConstraint is the address family a caller asked for with "tcp4" or
+// "tcp6". The zero value accepts either family, which is what "tcp" means.
+type familyConstraint int
+
+const (
+	familyAny familyConstraint = iota
+	familyV4
+	familyV6
+)
+
+func familyOf(network string) familyConstraint {
+	switch network {
+	case "tcp4":
+		return familyV4
+	case "tcp6":
+		return familyV6
 	}
-	if firstErr != nil {
-		return netip.AddrPort{}, firstErr
+	return familyAny
+}
+
+// allows reports whether a dial of this family can carry ip. Addresses reaching
+// here are already unmapped, so an IPv4-mapped IPv6 literal counts as IPv4.
+func (f familyConstraint) allows(ip netip.Addr) bool {
+	switch f {
+	case familyV4:
+		return ip.Is4()
+	case familyV6:
+		return ip.Is6()
 	}
-	return netip.AddrPort{}, fmt.Errorf("wireguard %s: resolve %s: no address", c.tag, host)
+	return true
+}
+
+func (f familyConstraint) String() string {
+	switch f {
+	case familyV4:
+		return "tcp4"
+	case familyV6:
+		return "tcp6"
+	}
+	return "tcp"
+}
+
+// addrPortList renders addresses for an error message.
+func addrPortList(addrs []netip.AddrPort) string {
+	parts := make([]string, 0, len(addrs))
+	for _, ap := range addrs {
+		parts = append(parts, ap.String())
+	}
+	return strings.Join(parts, ", ")
 }
 
 // routed reports whether the peer's allowed_ips can carry traffic to ap.

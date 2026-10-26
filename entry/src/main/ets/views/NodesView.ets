@@ -312,6 +312,28 @@ export struct NodesView {
     })
   }
 
+  /**
+   * The group head shows the *current member*: the node's display name when the
+   * selection is a node tag, the built-in name (`direct` / `reject`) when the
+   * core selected a built-in, and 自动 when the core has not chosen yet. Never
+   * an empty string and never `undefined`.
+   */
+  private nowLabel(group: GroupStatus): string {
+    const now: string = group.now;
+    if (now === undefined || now === null || now.length === 0) {
+      return '自动';
+    }
+    const members: NodeStatus[] = group.members === undefined || group.members === null ? [] : group.members;
+    for (let i = 0; i < members.length; i++) {
+      const member: NodeStatus = members[i];
+      if (member.tag === now) {
+        const remark: string = member.remark === undefined ? '' : member.remark;
+        return remark.length > 0 ? remark : now;
+      }
+    }
+    return now;
+  }
+
   @Builder
   groupHeader(group: GroupStatus) {
     Row({ space: 8 }) {
@@ -325,7 +347,7 @@ export struct NodesView {
 
       Tag({ label: group.type, tone: this.dark ? '#6366F1' : '#5B5BE6' })
 
-      Text(group.now.length > 0 ? group.now : '自动')
+      Text(this.nowLabel(group))
         .fontSize(11)
         .fontColor($r('app.color.veil_text_dim'))
         .maxLines(1)
