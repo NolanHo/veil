@@ -35,7 +35,7 @@ proxies:
     server: 203.0.113.10
     port: 3306
     cipher: 2022-blake3-aes-256-gcm
-    password: example-password
+    password: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
     udp: true
     dialer-proxy: "mdev-hk"
   - name: "日本家宽"

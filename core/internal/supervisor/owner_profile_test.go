@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"veil/internal/config"
 	"veil/internal/rpc"
 	"veil/internal/rules"
+	"veil/internal/state"
 )
 
 // ownerProfile is the shape of the profile the owner actually runs on the desktop
@@ -32,8 +34,9 @@ func TestOwnerProfileImportsWhole(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `
 proxies:
-  - {name: "HK 01", type: ss, server: 203.0.113.11, port: 8388, cipher: aes-128-gcm, password: pw}
+  - {name: "Hong Kong 01", type: ss, server: 203.0.113.11, port: 8388, cipher: aes-128-gcm, password: pw}
   - {name: "JP 01", type: ss, server: 203.0.113.12, port: 8388, cipher: aes-128-gcm, password: pw}
+  - {name: "US 01", type: ss, server: 203.0.113.13, port: 8388, cipher: aes-128-gcm, password: pw}
 `)
 	}))
 	defer srv.Close()
@@ -52,12 +55,12 @@ proxies:
 	cfg := sup.Config()
 	// Five nodes: hy2, chained ss, socks5, two WireGuard peers, plus the two the
 	// provider contributed.
-	if len(cfg.Nodes) != 7 {
+	if len(cfg.Nodes) != 8 {
 		tags := make([]string, 0, len(cfg.Nodes))
 		for _, n := range cfg.Nodes {
 			tags = append(tags, n.Tag)
 		}
-		t.Fatalf("nodes = %d %v, want 7 (5 in the document + 2 from the provider)", len(cfg.Nodes), tags)
+		t.Fatalf("nodes = %d %v, want 8 (5 in the document + 3 from the provider)", len(cfg.Nodes), tags)
 	}
 	// Eleven groups from the document plus the generated selector, which is what
 	// gives an imported profile a default exit without editing the document.
@@ -87,8 +90,8 @@ proxies:
 
 	// The provider's nodes reach the groups that only name it.
 	airport := groupByTag(t, cfg.Groups, "机场节点")
-	if len(airport.Members) != 2 {
-		t.Fatalf("机场节点 members = %v, want the two provider nodes", airport.Members)
+	if len(airport.Members) != 3 {
+		t.Fatalf("机场节点 members = %v, want the provider nodes", airport.Members)
 	}
 	// The filter on 日本 keeps the JP node and drops the HK one.
 	jp := groupByTag(t, cfg.Groups, "日本")
@@ -140,7 +143,7 @@ func TestOwnerProfileRoutesAsConfigured(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `
 proxies:
-  - {name: "HK 01", type: ss, server: 203.0.113.11, port: 8388, cipher: aes-128-gcm, password: pw}
+  - {name: "Hong Kong 01", type: ss, server: 203.0.113.11, port: 8388, cipher: aes-128-gcm, password: pw}
 `)
 	}))
 	defer srv.Close()
@@ -168,5 +171,52 @@ proxies:
 		if got != c.want {
 			t.Errorf("route %s = %q, want %q", c.host, got, c.want)
 		}
+	}
+}
+
+// The fixture must also build: every outbound in the profile has to construct,
+// including the chained node and the SOCKS5 line, and a group has to answer with
+// the member the profile names. Counting nodes proves the parser; this proves
+// the engine can use them.
+func TestOwnerProfileBuildsInTheEngine(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `
+proxies:
+  - {name: "Hong Kong 01", type: ss, server: 203.0.113.11, port: 8388, cipher: aes-128-gcm, password: pw}
+`)
+	}))
+	defer srv.Close()
+
+	sup := newRuleSupervisor(t)
+	if _, err := sup.Import(rpc.ImportParams{Text: replaceProviderURL(ownerProfile(t), srv.URL), Source: "owner"}); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := sup.Start(ctx, -1); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer sup.Stop(context.Background())
+
+	// Every group the profile names exists in the running engine, so its rules
+	// address something that can carry a connection.
+	running := map[string]bool{}
+	for _, g := range sup.Groups() {
+		running[g.Tag] = true
+	}
+	// 日本 and 美国 match nothing in this fake airport, so an engine that skips an
+	// empty group is behaving; the point here is that the groups which do have
+	// members — including the chained exit and a filtered selector — build.
+	for _, want := range []string{"选择代理", "出口包装", "机场节点", "自动选择", "香港", "Nolan-Lab", "gz-relay", "漏网之鱼"} {
+		if !running[want] {
+			t.Errorf("group %q is missing from the running engine (built: %v)", want, running)
+		}
+	}
+	// A phase of "degraded" with a build reason is exactly what this test
+	// guards: the profile parsed but the engine could not construct it.
+	st := sup.Status()
+	if st.Phase != state.PhaseRunning {
+		t.Errorf("phase = %s (%s), want running", st.Phase, st.Reason)
 	}
 }
