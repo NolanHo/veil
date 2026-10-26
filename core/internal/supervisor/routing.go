@@ -19,6 +19,11 @@ import (
 type routingTable struct {
 	Groups []config.Group
 	Rules  []config.Rule
+	// Providers are the document's `proxy-providers:` entries. They travel with
+	// the groups because a group's `use:` list names them: the members behind a
+	// provider are only known once it has been fetched, and that happens after
+	// the document has been merged (see importRows and applyProvider).
+	Providers []config.ProxyProvider
 
 	GroupsProvided bool
 	RulesProvided  bool
@@ -47,6 +52,7 @@ func clashRouting(c share.ClashConfig, errs []error) routingTable {
 	t := routingTable{
 		Groups:         c.Groups,
 		Rules:          c.Rules,
+		Providers:      c.Providers,
 		GroupsProvided: c.GroupsProvided,
 		RulesProvided:  c.RulesProvided,
 	}

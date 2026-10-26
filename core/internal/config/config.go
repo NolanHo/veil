@@ -121,6 +121,41 @@ type Group struct {
 	// groups of its own source only, and a group with no source was built by hand
 	// and is never touched.
 	Source string `json:"source,omitempty"`
+	// Providers names the proxy providers an imported Clash group collects
+	// through its `use:` list. Those members are not in the document at all —
+	// they live behind a URL or a file — so they are added to Members after
+	// parsing, by the expansion in internal/supervisor. A group may therefore
+	// have providers and no inline members; that is not an empty group (see
+	// Validate).
+	Providers []string `json:"providers,omitempty"`
+}
+
+// ProxyProvider is one `proxy-providers:` entry of an imported Clash/mihomo
+// profile: a node list that lives outside the profile and that groups collect by
+// name through `use:` (Group.Providers).
+//
+// Only what decides *which* nodes the provider contributes is modelled here. The
+// fetch and the expansion into a group's members belong to internal/supervisor;
+// this type carries enough for that to run and to be repeated on a refresh: a
+// URL for the http kind, a path for the file kind, and the name filters the
+// profile applied to the provider's node list.
+type ProxyProvider struct {
+	// Name is the provider's key in the document, which is the spelling a
+	// group's `use:` entry refers to.
+	Name string `json:"name"`
+	// Type is "http" (fetch URL) or "file" (read Path). Any other provider type
+	// is dropped at parse time with an error, because nothing here could read it.
+	Type string `json:"type"`
+	URL  string `json:"url,omitempty"`
+	Path string `json:"path,omitempty"`
+	// Interval is how often the provider should be refreshed, in seconds as the
+	// document states it; 0 leaves the cadence to the app.
+	Interval int `json:"interval,omitempty"`
+	// Filter and ExcludeFilter are the profile's regexes over the provider's node
+	// names: `filter` keeps what matches, `exclude-filter` drops what matches.
+	// They are applied when the provider's nodes are expanded into members.
+	Filter        string `json:"filter,omitempty"`
+	ExcludeFilter string `json:"exclude_filter,omitempty"`
 }
 
 // Rule is one routing rule. Rules are evaluated top to bottom; the first match
@@ -191,6 +226,11 @@ type Config struct {
 	Groups        []Group        `json:"groups"`
 	Rules         []Rule         `json:"rules"`
 	Subscriptions []Subscription `json:"subscriptions"`
+	// Providers are the proxy providers the imported profiles defined, by name
+	// (Group.Providers refers to them). Their nodes are stored like any other
+	// node, with Node.Source set to the provider's name, which is what lets a
+	// refresh replace exactly what one provider contributed.
+	Providers []ProxyProvider `json:"providers,omitempty"`
 }
 
 // Default returns a sane out-of-the-box configuration: a mixed inbound and a
@@ -264,6 +304,9 @@ func (c *Config) Validate() error {
 	}
 	if c.DNS.Servers == nil {
 		c.DNS.Servers = []DNSServer{}
+	}
+	if c.Providers == nil {
+		c.Providers = []ProxyProvider{}
 	}
 	for i := range c.Groups {
 		if c.Groups[i].Members == nil {
@@ -342,7 +385,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate outbound tag %q", g.Tag)
 		}
 		tags[g.Tag] = true
-		if len(g.Members) == 0 {
+		// A group with Providers is not empty even when Members is: its members
+		// are the nodes of those providers, which only the expansion can produce.
+		// Requiring Members here would make every imported profile that collects
+		// an airport subscription through `use:` unstorable.
+		if len(g.Members) == 0 && len(g.Providers) == 0 {
 			return fmt.Errorf("group %q: no members", g.Tag)
 		}
 	}

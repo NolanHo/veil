@@ -23,6 +23,10 @@ type clashDocument struct {
 	// at all says nothing about it. See ClashConfig.RulesProvided.
 	ProxyGroups yaml.Node `yaml:"proxy-groups"`
 	Rules       yaml.Node `yaml:"rules"`
+	// ProxyProviders stays a raw node as well: its keys are the names a group's
+	// `use:` list refers to, and the entries are decoded one at a time (see
+	// parseClashProviders) so one broken definition does not cost the others.
+	ProxyProviders yaml.Node `yaml:"proxy-providers"`
 }
 
 type clashProxy struct {

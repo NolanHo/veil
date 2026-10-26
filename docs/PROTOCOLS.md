@@ -89,6 +89,13 @@ Paste any of these into 规则 → 导入. The importer also accepts:
   section that failed to parse keeps it too and reports the error. Only the
   generated selector group grows when a later node link is imported — a
   profile's own groups keep the members the profile gave them.
+  `proxy-providers` (an airport subscription referenced by `use:`) are fetched
+  through the same protected dialer as a subscription URL, filtered with the
+  provider's `filter`/`exclude-filter`, and expanded into every group that lists
+  it; a provider that fails to fetch keeps the import alive and reports why.
+  `dialer-proxy` (dial one node *through* another) is not implemented: the node
+  is skipped with an error rather than dialed directly, because dialing it
+  directly would leave the device from the wrong address.
   `RULE-SET`/`GEOSITE` need external data and are skipped with a reported error
   rather than silently ignored;
 - a WireGuard `wg-quick` `.conf` (`[Interface]`/`[Peer]`, possibly repeated

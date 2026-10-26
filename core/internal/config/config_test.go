@@ -141,6 +141,78 @@ func TestGroupAutoMarkerRoundTrip(t *testing.T) {
 	}
 }
 
+// TestGroupWithProvidersNeedsNoMembers pins the import contract: a group that
+// collects an external provider (Group.Providers) has no inline members until
+// the provider is expanded, so validation must accept it — while a group that
+// names nothing at all is still rejected.
+func TestGroupWithProvidersNeedsNoMembers(t *testing.T) {
+	providerBacked := Config{
+		Nodes:  []Node{{Tag: "n1", Type: "direct"}},
+		Groups: []Group{{Tag: "airport", Type: "select", Members: []string{}, Providers: []string{"PROXY"}}},
+	}
+	if err := providerBacked.Validate(); err != nil {
+		t.Fatalf("Validate rejected a provider-backed group: %v", err)
+	}
+
+	empty := Config{
+		Nodes:  []Node{{Tag: "n1", Type: "direct"}},
+		Groups: []Group{{Tag: "empty", Type: "select", Members: []string{}}},
+	}
+	if err := empty.Validate(); err == nil {
+		t.Fatal("Validate accepted a group with neither members nor providers")
+	}
+}
+
+// TestProxyProviderJSONNames pins the on-disk spelling the supervisor and the
+// stored configuration share: a rename here would silently drop a provider's
+// URL or filters on the next load.
+func TestProxyProviderJSONNames(t *testing.T) {
+	blob, err := json.Marshal(ProxyProvider{
+		Name:          "airport",
+		Type:          "http",
+		URL:           "https://example.invalid/sub",
+		Path:          "./airport.yaml",
+		Interval:      86400,
+		Filter:        "hk",
+		ExcludeFilter: "traffic",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, field := range []string{
+		`"name"`, `"type"`, `"url"`, `"path"`, `"interval"`, `"filter"`, `"exclude_filter"`,
+	} {
+		if !bytes.Contains(blob, []byte(field)) {
+			t.Fatalf("marshalled provider misses %s:\n%s", field, blob)
+		}
+	}
+	var back ProxyProvider
+	if err := json.Unmarshal(blob, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Filter != "hk" || back.ExcludeFilter != "traffic" || back.Interval != 86400 {
+		t.Fatalf("round-trip = %+v", back)
+	}
+
+	// Backward compatibility: a group written before Providers existed still
+	// loads, and the field stays out of the JSON when it is empty.
+	legacy := Config{Nodes: []Node{{Tag: "n1", Type: "direct"}}, Groups: []Group{{Tag: "g", Type: "select", Members: []string{"n1"}}}}
+	legacyBlob, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(legacyBlob, []byte(`"providers"`)) {
+		t.Fatalf("an empty provider list is written to disk:\n%s", legacyBlob)
+	}
+	var backCfg Config
+	if err := json.Unmarshal(legacyBlob, &backCfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if err := backCfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
 // TestLoadMarksLegacyGeneratedSelector covers the upgrade path: a configuration
 // written before Group.Auto existed has no marker on the selector the app
 // generated, and reading it as user-curated would silently stop it from

@@ -50,6 +50,14 @@ type Supervisor struct {
 	tunFD     int
 	tunErr    string
 
+	// providerFetched records when each proxy provider was last fetched in this
+	// run, which is what the interval gate reads. The configuration has no field
+	// for it (a provider is a document statement, not a schedule), so it lives
+	// here: the first start of a run refetches every provider, exactly like the
+	// refresh-on-start a subscription gets, and the interval keeps the rest of
+	// the run quiet. Guarded by mu.
+	providerFetched map[string]providerFetch
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	loops  sync.WaitGroup
@@ -76,13 +84,14 @@ func New(cfgPath string, log *logx.Logger) (*Supervisor, error) {
 		log = logx.New(logx.ParseLevel(cfg.LogLevel), 1024)
 	}
 	s := &Supervisor{
-		cfgPath: cfgPath,
-		log:     log,
-		cfg:     cfg,
-		phase:   state.PhaseStopped,
-		since:   time.Now(),
-		tunFD:   -1,
-		reason:  "",
+		cfgPath:         cfgPath,
+		log:             log,
+		cfg:             cfg,
+		phase:           state.PhaseStopped,
+		since:           time.Now(),
+		tunFD:           -1,
+		reason:          "",
+		providerFetched: make(map[string]providerFetch),
 	}
 	return s, nil
 }
@@ -345,10 +354,11 @@ func (s *Supervisor) tryAttachTun() {
 }
 
 // startLoops launches the heartbeat and the health watchdog.
-// refreshDueSubscriptions refreshes the subscriptions whose update interval has
-// elapsed. It runs once per start rather than on a timer: a timer would wake a
-// device that is otherwise idle, and starting the tunnel is exactly when a
-// profile is expected to be current (Clash refreshes on launch too).
+// refreshDueSubscriptions refreshes the subscriptions and the proxy providers
+// whose update interval has elapsed. It runs once per start rather than on a
+// timer: a timer would wake a device that is otherwise idle, and starting the
+// tunnel is exactly when a profile is expected to be current (Clash refreshes on
+// launch too).
 func (s *Supervisor) refreshDueSubscriptions(ctx context.Context) {
 	s.mu.Lock()
 	var due []string
@@ -362,7 +372,11 @@ func (s *Supervisor) refreshDueSubscriptions(ctx context.Context) {
 		}
 	}
 	s.mu.Unlock()
-	if len(due) == 0 {
+	// Providers gate on the same "due" idea, but their last-fetch time lives in
+	// this run's memory (see providerFetched), so only a provider whose interval
+	// has really elapsed since the last fetch is downloaded again.
+	providers := s.dueProviders(time.Now())
+	if len(due) == 0 && len(providers) == 0 {
 		return
 	}
 	s.loops.Add(1)
@@ -377,6 +391,19 @@ func (s *Supervisor) refreshDueSubscriptions(ctx context.Context) {
 				continue
 			}
 			s.log.Infof("scheduled refresh of subscription %s done", name)
+		}
+		// Providers after subscriptions: a subscription body can define the
+		// providers it uses, and updateSubscription already fetched the ones it
+		// changed, which this loop then finds no longer due.
+		for _, name := range providers {
+			if ctx.Err() != nil {
+				return
+			}
+			if _, err := s.applyProvider(name); err != nil {
+				s.log.Warnf("scheduled refresh of provider %s failed: %v", name, err)
+				continue
+			}
+			s.log.Infof("scheduled refresh of provider %s done", name)
 		}
 	}()
 }

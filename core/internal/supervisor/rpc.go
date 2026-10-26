@@ -336,9 +336,11 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 	if text != "" {
 		nodes, errs = share.ParseText(text)
 		if len(nodes) == 0 {
-			// Not a link list: a Clash document brings groups and rules too, and
-			// those are the only way to send one subnet to one node.
-			if c, e2 := share.ParseClashConfig([]byte(text), p.Source); len(c.Nodes) > 0 {
+			// Not a link list: a Clash document brings groups, rules and the
+			// proxy providers those groups collect. Any of the three makes the
+			// document profile-shaped even without an inline node — a profile
+			// that keeps every node behind `proxy-providers:` is exactly that.
+			if c, e2 := share.ParseClashConfig([]byte(text), p.Source); len(c.Nodes) > 0 || len(c.Groups) > 0 || len(c.Providers) > 0 {
 				nodes, errs = c.Nodes, e2
 				tables = append(tables, clashRouting(c, errs))
 			}
@@ -362,9 +364,6 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 			}
 		}
 	}
-	if len(nodes) == 0 {
-		return res, fmt.Errorf("no nodes found in input")
-	}
 	source := p.Source
 	if source == "" {
 		source = p.Name
@@ -374,6 +373,47 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 			nodes[i].Source = source
 		}
 	}
+	return s.importRows(source, nodes, tables, res)
+}
+
+// importRows merges one import's parsed rows into the configuration and then
+// fetches the providers that import introduced.
+//
+// The split is deliberate: parsing belongs to internal/share, which is the only
+// layer that sees the document, and the merge plus the fetch belong here. The
+// fetch runs after the transaction because a provider URL can take the full
+// timeout, and holding the configuration lock across it would stall every other
+// write; it is also allowed to fail, because by then the profile's nodes, groups,
+// rules and provider definitions are stored and validated. One unreachable
+// airport must not cost the user their routing table — it costs their members,
+// with a warning that says so.
+func (s *Supervisor) importRows(source string, nodes []config.Node, tables []routingTable, res rpc.ImportResult) (rpc.ImportResult, error) {
+	// A document that keeps its nodes behind `proxy-providers:` carries none of
+	// them, and a group naming a provider it does not define carries none either;
+	// both still state routing the user wrote, so neither is an empty import.
+	providerCount := 0
+	usesProvider := false
+	for _, t := range tables {
+		providerCount += len(t.Providers)
+		for _, g := range t.Groups {
+			if len(g.Providers) > 0 {
+				usesProvider = true
+			}
+		}
+	}
+	if len(nodes) == 0 && providerCount == 0 && !usesProvider {
+		return res, fmt.Errorf("no nodes found in input")
+	}
+	warn := func(msg string) {
+		if len(res.Warnings) < maxImportWarnings {
+			res.Warnings = append(res.Warnings, msg)
+		}
+	}
+	// fetch collects the providers this import has to download: the ones it
+	// defined or redefined, plus any it names in a group while no stored node
+	// carries their name yet (an earlier fetch failed, or the definition arrived
+	// with another profile).
+	var fetch []string
 	// The merge runs on the transaction's own copy of the configuration, so a
 	// rejected import cannot leave half of itself in the live config.
 	err := s.commitConfig(func(cfg *config.Config) error {
@@ -386,9 +426,7 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 			documents[i] = &tables[i]
 		}
 		for _, w := range resolveIncomingTags(cfg, nodes, documents, origin) {
-			if len(res.Warnings) < maxImportWarnings {
-				res.Warnings = append(res.Warnings, w)
-			}
+			warn(w)
 		}
 		added, updated := mergeNodes(cfg, nodes)
 		res.Added, res.Updated = added, updated
@@ -404,12 +442,27 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 		// rules replace every stored rule, and they carry source so a later
 		// subscription refresh knows they are not its to replace.
 		for _, t := range tables {
+			for _, name := range mergeProviders(cfg, t.Providers) {
+				fetch = append(fetch, name)
+			}
 			groups, rules, warnings := mergeRoutingTable(cfg, t, origin)
 			res.Groups += groups
 			res.Rules += rules
 			for _, w := range warnings {
-				if len(res.Warnings) < maxImportWarnings {
-					res.Warnings = append(res.Warnings, w)
+				warn(w)
+			}
+		}
+		// The provider half of every group's membership is filled here, so a
+		// profile that collects an airport through `use:` validates with the
+		// members it is about to have, and an existing provider's nodes are in
+		// place before the fetch below decides what still needs downloading.
+		for _, w := range expandProviderGroups(cfg) {
+			warn(w)
+		}
+		for gi := range cfg.Groups {
+			for _, name := range cfg.Groups[gi].Providers {
+				if findProvider(cfg, name) != nil && providerNodeCount(cfg, name) == 0 {
+					fetch = append(fetch, name)
 				}
 			}
 		}
@@ -418,9 +471,49 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 	if err != nil {
 		return res, err
 	}
+	for _, name := range dedupeNames(fetch) {
+		warnings, err := s.applyProvider(name)
+		if err != nil {
+			msg := fmt.Sprintf("provider %q: %v", name, err)
+			warn(msg)
+			s.log.Warnf("%s", msg)
+			continue
+		}
+		for _, w := range warnings {
+			warn(w)
+		}
+		res.Tags = append(res.Tags, s.providerTags(name)...)
+	}
 	s.log.Infof("imported %d new and %d updated node(s), %d group(s), %d rule(s)",
 		res.Added, res.Updated, res.Groups, res.Rules)
 	return res, nil
+}
+
+// providerTags lists the tags of one provider's stored nodes, in stored order.
+func (s *Supervisor) providerTags(name string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, n := range s.cfg.Nodes {
+		if n.Source == name {
+			out = append(out, n.Tag)
+		}
+	}
+	return out
+}
+
+// dedupeNames keeps the first occurrence of every name, in order.
+func dedupeNames(names []string) []string {
+	seen := make(map[string]bool, len(names))
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
 }
 
 // Caps on the strings one import may return: a profile with a hundred broken
@@ -447,26 +540,44 @@ func mergeNodes(cfg *config.Config, nodes []config.Node) (added, updated int) {
 		cfg.Nodes = append(cfg.Nodes, n)
 		added++
 	}
-	// Keep one generated "proxy" select group containing every node, unless the
-	// user or an imported profile already defined groups.
-	if len(cfg.Groups) == 0 {
-		tags := make([]string, 0, len(cfg.Nodes))
-		for _, n := range cfg.Nodes {
-			tags = append(tags, n.Tag)
-		}
-		cfg.Groups = []config.Group{{
-			Tag:     config.AutoGroupTag,
-			Type:    "select",
-			Auto:    true,
-			Members: tags,
-			URL:     config.AutoGroupProbeURL,
-		}}
-		return added, updated
+	ensureAutoGroup(cfg)
+	growAutoGroups(cfg, nodes)
+	return added, updated
+}
+
+// ensureAutoGroup creates the generated "proxy" select group when the
+// configuration has no groups at all, unless there is not a single node to put
+// in it.
+//
+// The empty case is not hypothetical: a profile that keeps every node behind a
+// `proxy-providers:` entry reaches the merge before the provider has been
+// fetched, and creating the selector then would store a group with no members —
+// which validation refuses, taking the whole import down over a node list that is
+// merely still on its way. The same call runs after a provider lands, by which
+// time there are nodes to select.
+func ensureAutoGroup(cfg *config.Config) {
+	if len(cfg.Groups) != 0 || len(cfg.Nodes) == 0 {
+		return
 	}
-	// Only generated groups take the new nodes. A curated group's membership *is*
-	// the routing decision — a fallback group listing [reject] must keep sending
-	// traffic to reject, and a url-test group listing two nodes must not start
-	// testing a third because a link was pasted later.
+	tags := make([]string, 0, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		tags = append(tags, n.Tag)
+	}
+	cfg.Groups = []config.Group{{
+		Tag:     config.AutoGroupTag,
+		Type:    "select",
+		Auto:    true,
+		Members: tags,
+		URL:     config.AutoGroupProbeURL,
+	}}
+}
+
+// growAutoGroups adds nodes to every generated group. Only generated groups take
+// them: a curated group's membership *is* the routing decision — a fallback group
+// listing [reject] must keep sending traffic to reject, and a url-test group
+// listing two nodes must not start testing a third because a link was pasted
+// later. A node already in the group keeps its place.
+func growAutoGroups(cfg *config.Config, nodes []config.Node) {
 	for gi := range cfg.Groups {
 		if !cfg.Groups[gi].Auto {
 			continue
@@ -477,7 +588,6 @@ func mergeNodes(cfg *config.Config, nodes []config.Node) (added, updated int) {
 			}
 		}
 	}
-	return added, updated
 }
 
 func contains(list []string, v string) bool {
@@ -506,6 +616,7 @@ func (s *Supervisor) snapshot() config.Config {
 	}
 	cfg.Rules = append([]config.Rule(nil), s.cfg.Rules...)
 	cfg.Subscriptions = append([]config.Subscription(nil), s.cfg.Subscriptions...)
+	cfg.Providers = append([]config.ProxyProvider(nil), s.cfg.Providers...)
 	return cfg
 }
 
@@ -597,7 +708,11 @@ func pruneRouting(cfg *config.Config) {
 		}
 		groups := make([]config.Group, 0, len(cfg.Groups))
 		for _, g := range cfg.Groups {
-			if len(g.Members) > 0 {
+			// A group whose members are all gone is removed, unless it still
+			// names a provider: that group's membership is filled by a fetch, and
+			// dropping it would take the provider wiring — and every rule that
+			// addresses its tag — with it.
+			if len(g.Members) > 0 || len(g.Providers) > 0 {
 				groups = append(groups, g)
 				continue
 			}
@@ -652,11 +767,29 @@ func (s *Supervisor) SetConfig(cfg config.Config) (state.Status, error) {
 	if err := cfg.Validate(); err != nil {
 		return s.Status(), err
 	}
-	if err := s.commitConfig(func(cur *config.Config) error {
+	var removedProviders []string
+	err := s.commitConfig(func(cur *config.Config) error {
+		// A client that sends a configuration without a provider has deleted it.
+		// Its nodes arrived from a URL nobody will refresh any more, so they leave
+		// with it, together with the membership and rules that only existed to
+		// reach them — otherwise the stored configuration keeps outbounds the user
+		// cannot see the source of.
+		removedProviders = reconcileProviders(cur, &cfg, func(msg string) { s.log.Warnf("%s", msg) })
 		*cur = cfg
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		return s.Status(), err
+	}
+	// A deleted provider's fetch record goes with it: re-adding the same provider
+	// has to download it now, not inherit "fetched a minute ago" from a
+	// definition that no longer exists.
+	if len(removedProviders) > 0 {
+		s.mu.Lock()
+		for _, name := range removedProviders {
+			delete(s.providerFetched, name)
+		}
+		s.mu.Unlock()
 	}
 	if lvl := cfg.LogLevel; lvl != "" {
 		s.log.SetLevel(logLevel(lvl))
@@ -724,6 +857,7 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 	}
 
 	var groups, rules int
+	var fetchedProviders []string
 	err = s.commitConfig(func(cfg *config.Config) error {
 		// The fetch ran outside the lock, so the subscription may have been
 		// deleted or repointed meanwhile. The body speaks for the address it was
@@ -770,6 +904,13 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 		for _, w := range warnings {
 			s.log.Warnf("subscription %s: %s", name, w)
 		}
+		// A subscription body may also define the providers its groups collect
+		// (`proxy-providers:` in a Clash document), so a refresh merges those
+		// definitions too and remembers which ones changed. They are fetched
+		// below, outside the lock, like any other provider.
+		for _, pname := range mergeProviders(cfg, routing.Providers) {
+			fetchedProviders = append(fetchedProviders, pname)
+		}
 		// Rebuild group membership for the refreshed subscription: members that
 		// point at one of its nodes which is gone are dropped, and only the
 		// generated groups take the nodes that arrived. A curated group keeps the
@@ -791,6 +932,12 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 			}
 			cfg.Groups[gi].Members = members
 		}
+		// Groups that collect a provider through `use:` take their members from
+		// that provider, refreshed or not, so the provider half is recomputed from
+		// the nodes that are actually stored.
+		for _, w := range expandProviderGroups(cfg) {
+			s.log.Warnf("subscription %s: %s", name, w)
+		}
 		// Dropping one of the subscription's groups can leave another rule (one
 		// the user wrote) addressing a tag that no longer exists, and emptying a
 		// group can strand the groups above it; validation would refuse the whole
@@ -803,6 +950,11 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 	})
 	if err != nil {
 		return nil, err
+	}
+	for _, pname := range dedupeNames(fetchedProviders) {
+		if _, err := s.applyProvider(pname); err != nil {
+			s.log.Warnf("subscription %s: provider %s: %v", name, pname, err)
+		}
 	}
 	s.log.Infof("subscription %s updated: %d node(s), %d group(s), %d rule(s)",
 		name, len(nodes), groups, rules)

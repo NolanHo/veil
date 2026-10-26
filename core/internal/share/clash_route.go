@@ -26,6 +26,13 @@ type ClashConfig struct {
 	Groups []config.Group
 	Rules  []config.Rule
 
+	// Providers are the document's `proxy-providers:` entries. They are part of
+	// this result because the groups reference them by name: a group whose
+	// members come from a provider keeps that reference (Group.Providers) and is
+	// expanded later, so the definition has to travel with the groups that need
+	// it.
+	Providers []config.ProxyProvider
+
 	// RulesProvided reports whether the document had a `rules:` key at all.
 	// It is true for an explicit empty list — and for a bare `rules:` with no
 	// value under it — and false when the key is absent. Those are different
@@ -80,6 +87,8 @@ func ParseClashConfig(doc []byte, source string) (ClashConfig, []error) {
 	// A section whose value has the wrong shape does not take the document down:
 	// the rest of the profile still imports, and the presence bit still says the
 	// document tried to state that section.
+	providers := parseClashProviders(&d.ProxyProviders, &errs)
+
 	groupEntries, groupsProvided, err := clashSection(&d.ProxyGroups)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("share: clash proxy-groups: %w", err))
@@ -96,6 +105,7 @@ func ParseClashConfig(doc []byte, source string) (ClashConfig, []error) {
 		Nodes:          nodes,
 		Groups:         groups,
 		Rules:          rules,
+		Providers:      providers,
 		RulesProvided:  rulesProvided,
 		GroupsProvided: groupsProvided,
 	}, errs
@@ -114,12 +124,98 @@ func clashSection(n *yaml.Node) (entries []yaml.Node, present bool, err error) {
 	return entries, true, nil
 }
 
+// clashProvider is one `proxy-providers:` entry.
+type clashProvider struct {
+	Type          string `yaml:"type"`
+	URL           string `yaml:"url"`
+	Path          string `yaml:"path"`
+	Interval      any    `yaml:"interval"`
+	Filter        string `yaml:"filter"`
+	ExcludeFilter string `yaml:"exclude-filter"`
+}
+
+// parseClashProviders reads the top-level `proxy-providers:` mapping into the
+// definitions a group's `use:` list needs.
+//
+// Only the keys that decide *which* nodes a provider can contribute are read.
+// `override`, `health-check` and `proxy` are ignored on purpose and are not an
+// error: override rewrites fields of the fetched nodes, health-check drives
+// mihomo's own probing, and proxy names the outbound mihomo fetches through —
+// none of them changes the set of nodes a profile expects in its groups, and
+// nearly every real profile carries a health-check block, so reporting them
+// would fill the import report with noise about fields that cost nothing.
+//
+// A provider whose type this build cannot read is skipped and reported: keeping
+// it would leave the groups that use it empty with no explanation.
+func parseClashProviders(n *yaml.Node, errs *[]error) []config.ProxyProvider {
+	if n.Kind == 0 {
+		return nil
+	}
+	// A bare `proxy-providers:` is an explicitly empty mapping, not an error.
+	if n.Kind == yaml.ScalarNode && n.Tag == "!!null" {
+		return nil
+	}
+	if n.Kind != yaml.MappingNode {
+		*errs = append(*errs, fmt.Errorf(
+			"share: clash proxy-providers: expected a mapping, got a %s", yamlKindName(n.Kind)))
+		return nil
+	}
+	out := make([]config.ProxyProvider, 0, len(n.Content)/2)
+	// Provider names are one namespace, like proxy and group names: two
+	// definitions under one name would make `use:` pick one of them silently.
+	seen := make(map[string]bool, len(n.Content)/2)
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		key, value := n.Content[i], n.Content[i+1]
+		name := NormalizeTag(key.Value)
+		if name == "" {
+			*errs = append(*errs, fmt.Errorf("share: clash proxy-provider %d: missing name", i/2))
+			continue
+		}
+		var p clashProvider
+		if err := value.Decode(&p); err != nil {
+			*errs = append(*errs, fmt.Errorf("share: clash proxy-provider %q: %w", name, err))
+			continue
+		}
+		typ := strings.ToLower(strings.TrimSpace(p.Type))
+		switch typ {
+		case "http", "file":
+		case "":
+			*errs = append(*errs, fmt.Errorf("share: clash proxy-provider %q: missing type", name))
+			continue
+		default:
+			*errs = append(*errs, fmt.Errorf(
+				"share: clash proxy-provider %q: unsupported provider type %q", name, p.Type))
+			continue
+		}
+		if seen[name] {
+			*errs = append(*errs, fmt.Errorf(
+				"share: clash proxy-provider %q: name is used by more than one definition; kept the first", name))
+			continue
+		}
+		seen[name] = true
+		out = append(out, config.ProxyProvider{
+			Name:          name,
+			Type:          typ,
+			URL:           strings.TrimSpace(p.URL),
+			Path:          strings.TrimSpace(p.Path),
+			Interval:      asInt(p.Interval),
+			Filter:        strings.TrimSpace(p.Filter),
+			ExcludeFilter: strings.TrimSpace(p.ExcludeFilter),
+		})
+	}
+	return out
+}
+
 // clashGroup is one `proxy-groups:` entry.
 type clashGroup struct {
 	Name    string    `yaml:"name"`
 	Type    string    `yaml:"type"`
 	Proxies yaml.Node `yaml:"proxies"`
-	URL     string    `yaml:"url"`
+	// Use lists proxy-provider names. It is not an outbound reference: the
+	// members behind a provider are only known once it has been fetched, so the
+	// list is kept as written and expanded later.
+	Use yaml.Node `yaml:"use"`
+	URL string    `yaml:"url"`
 	// Interval and tolerance are seconds/milliseconds written either bare or
 	// quoted, so they stay raw and go through asInt.
 	Interval  any `yaml:"interval"`
@@ -139,6 +235,30 @@ const (
 	groupDropped
 )
 
+// normalizeProviderNames puts the `use:` entries into the spelling provider
+// names are kept in, and drops repeats: the same provider twice would expand to
+// the same nodes twice. Nil means the group names no provider at all, so an
+// empty result stays nil and is omitted from the stored group.
+func normalizeProviderNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		key := NormalizeTag(name)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // parseClashGroups turns the `proxy-groups:` entries into config.Group values.
 //
 // Groups are ordered so that a group is placed after every group it lists: the
@@ -150,6 +270,10 @@ const (
 // built-ins. A name that collides with either is skipped and reported: keeping
 // it would produce a tag that overwrites (or is shadowed by) the other outbound,
 // so references would silently land on the wrong destination.
+//
+// A group that collects its members from proxy providers (`use:`) is returned
+// with those references in Providers and an empty Members list: the members only
+// exist after the provider has been fetched, which is the supervisor's job.
 func parseClashGroups(entries []yaml.Node, ns *clashNamespace, errs *[]error) []config.Group {
 	plans := make([]*groupPlan, 0, len(entries))
 	index := make(map[string]int, len(entries)) // group tag -> plan index
@@ -174,10 +298,20 @@ func parseClashGroups(entries []yaml.Node, ns *clashNamespace, errs *[]error) []
 			*errs = append(*errs, fmt.Errorf("share: clash group %q: %w", tag, err))
 			continue
 		}
-		if len(members) == 0 {
+		use, err := listValue("use", &g.Use)
+		if err != nil {
+			*errs = append(*errs, fmt.Errorf("share: clash group %q: %w", tag, err))
+			continue
+		}
+		// A group that names neither inline members nor a provider is genuinely
+		// empty; a group that names only a provider is not, and it must survive:
+		// routing rules address it by name, so dropping it here deletes the
+		// outbound every one of those rules sends traffic to.
+		if len(members) == 0 && len(use) == 0 {
 			*errs = append(*errs, fmt.Errorf("share: clash group %q: no members", tag))
 			continue
 		}
+		providers := normalizeProviderNames(use)
 		if _, dup := index[tag]; dup {
 			*errs = append(*errs, fmt.Errorf("share: clash group %q: duplicate group name", tag))
 			continue
@@ -205,6 +339,7 @@ func parseClashGroups(entries []yaml.Node, ns *clashNamespace, errs *[]error) []
 				URL:       strings.TrimSpace(g.URL),
 				Interval:  asInt(g.Interval),
 				Tolerance: asInt(g.Tolerance),
+				Providers: providers,
 			},
 			names: members,
 		})
@@ -252,11 +387,16 @@ func parseClashGroups(entries []yaml.Node, ns *clashNamespace, errs *[]error) []
 			seen[tag] = true
 			members = append(members, tag)
 		}
-		if len(members) == 0 {
+		if len(members) == 0 && len(plan.cfg.Providers) == 0 {
 			state[i] = groupDropped
 			*errs = append(*errs, fmt.Errorf("share: clash group %q: no usable members", plan.cfg.Tag))
 			return false
 		}
+		// A group whose only members come from providers is left with an empty
+		// member list on purpose: the expansion (internal/supervisor) fills it
+		// from the providers named in Providers. The group is still an
+		// addressable outbound, so rules naming it keep working, and groups that
+		// list it are still ordered after it.
 		plan.cfg.Members = members
 		// The group is now an addressable outbound: a rule action naming it
 		// resolves to its tag, and a later group listing it is ordered after it.
