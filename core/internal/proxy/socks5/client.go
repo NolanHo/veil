@@ -174,6 +174,9 @@ func (c *Client) authenticate(conn net.Conn) error {
 	if _, err := io.ReadFull(conn, reply); err != nil {
 		return fmt.Errorf("socks5 %q: read auth reply: %w", c.tag, err)
 	}
+	if reply[0] != 0x01 {
+		return fmt.Errorf("socks5 %q: authentication reply has version %d", c.tag, reply[0])
+	}
 	if reply[1] != 0x00 {
 		return fmt.Errorf("socks5 %q: authentication rejected (status %d)", c.tag, reply[1])
 	}

@@ -185,7 +185,10 @@ func finalizeWithAliases(nodes []config.Node) finalizeResult {
 
 // dedupeKey builds the identity string used for duplicate detection.
 func dedupeKey(n config.Node) string {
-	cred := n.UUID + "|" + n.Password + "|" + n.Method
+	// Username and the chained hop change who we dial as and where the
+	// connection leaves from: two entries that differ only there are different
+	// outbounds, and merging them sends a group to the wrong one.
+	cred := n.UUID + "|" + n.Username + "|" + n.Password + "|" + n.Method + "|" + n.DialerProxy
 	var tr string
 	if n.Transport != nil {
 		tr = n.Transport.Type + "|" + n.Transport.Path + "|" + n.Transport.Host + "|" + n.Transport.ServiceName

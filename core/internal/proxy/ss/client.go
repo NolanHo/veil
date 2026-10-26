@@ -42,6 +42,11 @@ type Client struct {
 	mu      sync.Mutex
 	closed  bool
 	packets map[*packetConn]struct{}
+
+	// chained is true when the TCP connection to the server rides on another
+	// outbound (mihomo's dialer-proxy). UDP has no stream to ride on, so such a
+	// node cannot relay it without leaving the hop the profile named.
+	chained bool
 }
 
 var (
@@ -85,6 +90,7 @@ func NewVia(n config.Node, base transport.Dialer) (*Client, error) {
 		serverAddr: n.Addr(),
 		dialer:     dialer,
 		packets:    make(map[*packetConn]struct{}),
+		chained:    base != nil,
 	}, nil
 }
 
@@ -204,6 +210,12 @@ func (c *Client) DialPacket(ctx context.Context, address string) (outbound.Packe
 	c.mu.Unlock()
 	if closed {
 		return nil, fmt.Errorf("ss %s: client closed", c.tag)
+	}
+	if c.chained {
+		// UDP has no stream to ride on, so a chained node would send its
+		// datagrams from the local address instead of through the hop the
+		// profile named. Refusing lets the caller fall back to TCP.
+		return nil, fmt.Errorf("ss %s: udp is not relayed through a chained outbound", c.tag)
 	}
 
 	if _, ok := ctx.Deadline(); !ok {

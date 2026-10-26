@@ -272,15 +272,6 @@ func (e *Engine) Start(ctx context.Context, tunFD int) error {
 	return nil
 }
 
-// buildOutbound constructs one protocol client.
-//
-// Socket protection is not wired here: every transport goes through
-// transport.TCP/NewDialer, which applies the process-wide protect hook. That
-// keeps HarmonyOS fd protection impossible to forget in a new protocol.
-func (e *Engine) buildOutbound(n config.Node) (outbound.Outbound, error) {
-	return factory.New(n)
-}
-
 func (e *Engine) resolveTag(tag string) outbound.Outbound {
 	if tag == "" {
 		return nil

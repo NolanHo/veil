@@ -16,6 +16,7 @@ import (
 	"veil/internal/rpc"
 	"veil/internal/share"
 	"veil/internal/state"
+	"veil/internal/transport"
 	"veil/internal/version"
 )
 
@@ -1061,7 +1062,18 @@ func (s *Supervisor) fetchSubscription(url, name string) (subscriptionBody, erro
 	}
 	req.Header.Set("User-Agent", version.UserAgent)
 	req.Header.Set("Accept", "*/*")
-	client := &http.Client{Timeout: 25 * time.Second}
+	// The protect-aware dialer, like every other socket the core opens: the
+	// default transport sends the fetch out of an unprotected socket, which on a
+	// device is a packet addressed to the tunnel's own gateway.
+	client := &http.Client{
+		Timeout: 25 * time.Second,
+		Transport: &http.Transport{
+			DialContext:           transport.NewDialer().DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 20 * time.Second,
+			ForceAttemptHTTP2:     true,
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return subscriptionBody{}, err

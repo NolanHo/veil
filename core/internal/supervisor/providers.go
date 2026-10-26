@@ -291,6 +291,25 @@ func reconcileProviders(prev, next *config.Config, warn func(string)) (removed [
 	if len(removed) == 0 {
 		return nil
 	}
+	// A node that dialed *through* a provider node just lost its hop. Leaving
+	// the reference would save a config the engine then cannot build, and the
+	// rules pointing at that node would quietly fall through to the default
+	// outbound; clearing it keeps the node usable and says so.
+	for i := range next.Nodes {
+		if next.Nodes[i].DialerProxy == "" {
+			continue
+		}
+		for _, name := range removed {
+			if findNode(prev, next.Nodes[i].DialerProxy) != nil &&
+				findNode(next, next.Nodes[i].DialerProxy) == nil {
+				warn(fmt.Sprintf(
+					"node %q dialed through %q, which belonged to the removed provider %q: it dials directly now",
+					next.Nodes[i].Tag, next.Nodes[i].DialerProxy, name))
+				next.Nodes[i].DialerProxy = ""
+				break
+			}
+		}
+	}
 	gone := make(map[string]bool, len(removed))
 	for _, name := range removed {
 		gone[name] = true
@@ -309,6 +328,16 @@ func reconcileProviders(prev, next *config.Config, warn func(string)) (removed [
 	dropEmptyGroups(next)
 	pruneRouting(next)
 	return removed
+}
+
+// findNode returns the node with this tag, or nil.
+func findNode(cfg *config.Config, tag string) *config.Node {
+	for i := range cfg.Nodes {
+		if cfg.Nodes[i].Tag == tag {
+			return &cfg.Nodes[i]
+		}
+	}
+	return nil
 }
 
 // dropEmptyGroups removes groups that can never carry traffic: no members and no
@@ -370,13 +399,16 @@ func (s *Supervisor) providerDue(p config.ProxyProvider, now time.Time) bool {
 // timeout), so by the time the body arrives the provider may have been deleted or
 // pointed somewhere else. The body speaks for the address it came from; applying
 // it to a different one would install nodes the user just asked to be rid of.
-func stillProvided(cfg *config.Config, name, url string) error {
-	p := findProvider(cfg, name)
+func stillProvided(cfg *config.Config, fetched config.ProxyProvider) error {
+	p := findProvider(cfg, fetched.Name)
 	if p == nil {
-		return fmt.Errorf("provider %q was removed while it was being fetched", name)
+		return fmt.Errorf("provider %q was removed while it was being fetched", fetched.Name)
 	}
-	if p.URL != url {
-		return fmt.Errorf("provider %q was pointed at %q while it was being fetched; fetch it again", name, p.URL)
+	// The whole definition, not just the URL: a filter that changed mid-fetch
+	// would otherwise apply the new rules to the old response, and the stale
+	// result would be recorded as this interval's answer.
+	if *p != fetched {
+		return fmt.Errorf("provider %q changed while it was being fetched; fetch it again", fetched.Name)
 	}
 	return nil
 }
@@ -416,7 +448,7 @@ func (s *Supervisor) applyProvider(name string) (warnings []string, err error) {
 	}
 	warnings = append(warnings, fetchWarnings...)
 	err = s.commitConfig(func(cfg *config.Config) error {
-		if err := stillProvided(cfg, name, p.URL); err != nil {
+		if err := stillProvided(cfg, p); err != nil {
 			return err
 		}
 		// A tag is one outbound: a provider node whose name another source
