@@ -459,6 +459,11 @@ func (s *Supervisor) importRows(source string, nodes []config.Node, tables []rou
 		for _, w := range expandProviderGroups(cfg) {
 			warn(w)
 		}
+		// Now that the provider half is in place, a pin that still names nothing
+		// is genuinely gone and is cleared with a warning.
+		for _, w := range clearDanglingSelections(cfg) {
+			warn(w)
+		}
 		for gi := range cfg.Groups {
 			for _, name := range cfg.Groups[gi].Providers {
 				if findProvider(cfg, name) != nil && providerNodeCount(cfg, name) == 0 {

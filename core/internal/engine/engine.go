@@ -20,6 +20,7 @@ import (
 	"veil/internal/proxy/factory"
 	"veil/internal/rules"
 	"veil/internal/state"
+	"veil/internal/transport"
 )
 
 // ErrRejected is returned when a routing rule blocks a connection.
@@ -507,17 +508,21 @@ func (e *Engine) setLastErr(s string) {
 	e.lastErrMu.Unlock()
 }
 
-// dnsDial builds the dialer the resolver uses: proxy detours go through the
-// matching outbound, everything else is direct.
+// dnsDial builds the dialer the resolver uses.
+//
+// It is direct by default, and deliberately so: routing asks the resolver which
+// IP a domain has in order to classify the connection, and sending that question
+// through the proxy answers it from the exit node's point of view. A domestic
+// CDN then looks foreign, `GEOIP,CN` stops matching, and the traffic the profile
+// meant to keep local leaves through the proxy. It also makes classification
+// depend on the proxy being up: with the exit down, every domain rule that needs
+// an address would fail.
+//
+// DNSServer.Detour is not wired into this dialer yet: a profile that asks for a
+// remote resolver on purpose gets a direct one, which is the safer of the two
+// mistakes (it cannot make classification depend on the exit).
 func (e *Engine) dnsDial(ctx context.Context, network, address string) (net.Conn, error) {
-	e.mu.RLock()
-	ob := e.defaultOB
-	e.mu.RUnlock()
-	if ob == nil {
-		var d net.Dialer
-		return d.DialContext(ctx, network, address)
-	}
-	return ob.DialContext(ctx, network, address)
+	return transport.NewDialer().DialContext(ctx, network, address)
 }
 
 // parseTarget splits host:port and classifies the host.

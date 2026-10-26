@@ -211,8 +211,9 @@ func (c *Client) DialPacket(ctx context.Context, address string) (outbound.Packe
 		ctx, cancel = context.WithTimeout(ctx, dialTimeout)
 		defer cancel()
 	}
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "udp", c.serverAddr)
+	// The protect-aware dialer, like every other socket in the core: a plain
+	// net.Dialer sends the datagrams back into our own tun.
+	conn, err := transport.NewDialer().DialContext(ctx, "udp", c.serverAddr)
 	if err != nil {
 		return nil, fmt.Errorf("ss %s: dial udp %s: %w", c.tag, c.serverAddr, err)
 	}

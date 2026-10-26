@@ -145,10 +145,12 @@ func (e *Engine) HandleUDP(ctx context.Context, payload []byte, target, source s
 	po, ok := ob.(outbound.PacketOutbound)
 	if !ok {
 		// e.g. VLESS with xtls-rprx-vision: Xray requires UDP to ride on MUX,
-		// which we have not implemented. Falling back to a direct association
-		// keeps QUIC and plain DNS from stalling for seconds per flow.
-		e.log.Infof("udp via %s unsupported, using direct udp for %s", ob.Tag(), target)
-		return e.directUDP(ctx, payload, target)
+		// which we have not implemented. This used to fall back to a direct
+		// association "so QUIC does not stall", which quietly sent the traffic
+		// out of the local interface — from the wrong address, outside the
+		// chain, and for a rule that said "this subnet goes through the
+		// tunnel". Failing lets the application fall back to TCP.
+		return nil, fmt.Errorf("udp via %s is not supported by this outbound", ob.Tag())
 	}
 
 	key := udpKey{ob: ob.Tag(), target: target}

@@ -280,3 +280,53 @@ func groupTags(groups []config.Group) []string {
 	}
 	return out
 }
+
+// The airport idiom `^((?!Traffic).)*$` must keep quota/expiry pseudo-nodes out
+// of a selector. Go's RE2 has no lookahead, so it is translated rather than
+// silently treated as "keep everything".
+func TestClashGroupLookaheadFilterBecomesExclusion(t *testing.T) {
+	doc := `
+proxy-providers:
+  airport: {type: http, url: "http://example.invalid/sub"}
+proxy-groups:
+  - name: auto
+    type: fallback
+    use: [airport]
+    filter: "^((?!Traffic).)*$"
+rules:
+  - MATCH,auto
+`
+	cfg, errs := ParseClashConfig([]byte(doc), "clash")
+	if len(errs) != 0 {
+		t.Fatalf("errors: %v", errs)
+	}
+	g := groupByTag(t, cfg.Groups)["auto"]
+	if g.Filter != "" || g.ExcludeFilter != "Traffic" {
+		t.Fatalf("group filter = %q exclude = %q, want the lookahead translated to an exclusion", g.Filter, g.ExcludeFilter)
+	}
+}
+
+// A filter this build cannot compile is reported, not ignored.
+func TestClashGroupUncompilableFilterIsReported(t *testing.T) {
+	doc := `
+proxy-providers:
+  airport: {type: http, url: "http://example.invalid/sub"}
+proxy-groups:
+  - name: auto
+    type: fallback
+    use: [airport]
+    filter: "(?<=x)y"
+rules:
+  - MATCH,auto
+`
+	_, errs := ParseClashConfig([]byte(doc), "clash")
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "filter") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("errors = %v, want the unusable filter reported", errs)
+	}
+}

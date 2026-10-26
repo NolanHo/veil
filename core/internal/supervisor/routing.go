@@ -234,6 +234,11 @@ func mergeRoutingTable(cfg *config.Config, t routingTable, origin routingOrigin)
 					case old.Selected == "":
 					case contains(g.Members, old.Selected):
 						g.Selected = old.Selected
+					case len(g.Providers) > 0:
+						// The provider's nodes are not expanded yet, so an empty
+						// member list proves nothing: keep the pin and let the
+						// post-expansion pass clear it if the node really is gone.
+						g.Selected = old.Selected
 					default:
 						// A pin can only survive while its member does. Clearing it
 						// changes where traffic exits, so it is reported.

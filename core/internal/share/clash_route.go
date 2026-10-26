@@ -128,6 +128,52 @@ func clashSection(n *yaml.Node) (entries []yaml.Node, present bool, err error) {
 	return entries, true, nil
 }
 
+// normalizeNameFilter makes a group's filter usable by this build.
+//
+// mihomo compiles these with a regex engine that supports lookahead, and a very
+// common profile idiom is `^((?!Traffic).)*$` — "everything whose name does not
+// mention Traffic" — used to keep the airport's quota and expiry pseudo-nodes
+// out of a selector. Go's RE2 cannot express that, and silently keeping every
+// node would put "剩余流量：100 GB" into a fallback group, where it would be the
+// first thing dialed.
+//
+// So the exclusion form is translated into the equivalent exclude-filter, and
+// anything else that does not compile is reported instead of ignored: a filter
+// the user wrote and this build cannot honour must be visible.
+func normalizeNameFilter(filter, exclude string) (string, string, error) {
+	filter = strings.TrimSpace(filter)
+	exclude = strings.TrimSpace(exclude)
+	if filter == "" {
+		return "", exclude, nil
+	}
+	if _, err := regexp.Compile(filter); err == nil {
+		return filter, exclude, nil
+	}
+	if inner, ok := lookaheadExclusion(filter); ok {
+		if exclude == "" {
+			return "", inner, nil
+		}
+		return "", "(?:" + exclude + ")|(?:" + inner + ")", nil
+	}
+	return "", exclude, fmt.Errorf(
+		"filter %q is not a pattern this build can compile (lookahead is unsupported)", filter)
+}
+
+// lookaheadExclusion unwraps the `^((?!X).)*$` idiom into X.
+func lookaheadExclusion(pattern string) (string, bool) {
+	trimmed := strings.TrimSpace(pattern)
+	const head = "^((?!"
+	const tail = ").)*$"
+	if !strings.HasPrefix(trimmed, head) || !strings.HasSuffix(trimmed, tail) {
+		return "", false
+	}
+	inner := trimmed[len(head) : len(trimmed)-len(tail)]
+	if inner == "" {
+		return "", false
+	}
+	return inner, true
+}
+
 // clashProvider is one `proxy-providers:` entry.
 type clashProvider struct {
 	Type          string `yaml:"type"`
@@ -337,6 +383,10 @@ func parseClashGroups(entries []yaml.Node, ns *clashNamespace, errs *[]error) []
 				"share: clash group %q: tag is already used by an imported node", tag))
 			continue
 		}
+		nameFilter, excludeFilter, ferr := normalizeNameFilter(g.Filter, g.ExcludeFilter)
+		if ferr != nil {
+			*errs = append(*errs, fmt.Errorf("share: clash group %q: %w", tag, ferr))
+		}
 		index[tag] = len(plans)
 		plans = append(plans, &groupPlan{
 			cfg: config.Group{
@@ -348,8 +398,8 @@ func parseClashGroups(entries []yaml.Node, ns *clashNamespace, errs *[]error) []
 				Providers: providers,
 				// mihomo writes these on the group and applies them to the
 				// provider's nodes only; they never filter an inline member.
-				Filter:        strings.TrimSpace(g.Filter),
-				ExcludeFilter: strings.TrimSpace(g.ExcludeFilter),
+				Filter:        nameFilter,
+				ExcludeFilter: excludeFilter,
 			},
 			names: members,
 		})

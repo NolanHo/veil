@@ -1,8 +1,12 @@
 package supervisor
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"veil/internal/config"
@@ -185,5 +189,45 @@ func TestRefreshClearsASelectionTheNodeListDropped(t *testing.T) {
 	}
 	if !logsContain(sup, "selection was cleared") {
 		t.Fatalf("clearing the selection was not reported, log = %v", sup.log.Snapshot(0, 512))
+	}
+}
+
+// A select group fed only by a provider cannot validate its pin before the
+// provider is expanded: an empty member list is not evidence that the node is
+// gone. Clearing it there silently moved the user's choice back to the first
+// member on every re-import.
+func TestReimportKeepsSelectionOfAProviderOnlyGroup(t *testing.T) {
+	var body atomic.Value
+	body.Store(`
+proxies:
+  - {name: "HK 01", type: ss, server: 203.0.113.11, port: 8388, cipher: aes-128-gcm, password: pw}
+  - {name: "JP 01", type: ss, server: 203.0.113.12, port: 8388, cipher: aes-128-gcm, password: pw}
+`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body.Load().(string))
+	}))
+	defer srv.Close()
+
+	doc := fmt.Sprintf(`
+proxy-providers:
+  airport: {type: http, url: "%s"}
+proxy-groups:
+  - {name: pick, type: select, use: [airport]}
+rules:
+  - MATCH,pick
+`, srv.URL)
+
+	sup := newRuleSupervisor(t)
+	if _, err := sup.Import(rpc.ImportParams{Text: doc, Source: "sub"}); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if _, err := sup.Select(rpc.SelectParams{Group: "pick", Tag: "JP 01"}); err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if _, err := sup.Import(rpc.ImportParams{Text: doc, Source: "sub"}); err != nil {
+		t.Fatalf("re-import: %v", err)
+	}
+	if got := groupByTag(t, sup.Config().Groups, "pick").Selected; got != "JP 01" {
+		t.Fatalf("selection after re-import = %q, want JP 01", got)
 	}
 }
