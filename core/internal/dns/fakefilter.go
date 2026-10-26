@@ -24,10 +24,10 @@ var fakeIPBypassSuffixes = []string{"local", "lan", "internal", "home.arpa", "lo
 // appends its own search domain, and mDNS answers `.local` — so they bypass too.
 // Everything else keeps the fake answer, which is the whole point of the pool.
 //
-// There is no configured list to merge with: config.DNSConfig has no filter
-// field yet. When one is added it should extend this list, with the configured
-// entries winning on a conflict.
-func bypassFakeIP(host string) bool {
+// A configured list (config.DNSConfig.FakeIPFilter) extends the built-in one;
+// entries are suffixes, and a leading "+." or "*." is accepted because the
+// profile format writes both spellings.
+func bypassFakeIP(host string, configured []string) bool {
 	name := normalizeHost(host)
 	if name == "" {
 		return false
@@ -40,5 +40,22 @@ func bypassFakeIP(host string) bool {
 			return true
 		}
 	}
+	for _, suffix := range configured {
+		s := normalizeConfiguredSuffix(suffix)
+		if s == "" {
+			continue
+		}
+		if name == s || strings.HasSuffix(name, "."+s) {
+			return true
+		}
+	}
 	return false
+}
+
+// normalizeConfiguredSuffix strips the wildcard spelling a profile may use.
+func normalizeConfiguredSuffix(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	s = strings.TrimPrefix(s, "+.")
+	s = strings.TrimPrefix(s, "*.")
+	return strings.TrimSuffix(s, ".")
 }

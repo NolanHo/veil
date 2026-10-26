@@ -193,6 +193,11 @@ type DNSConfig struct {
 	Servers []DNSServer `json:"servers"`
 	Final   string      `json:"final,omitempty"` // server tag used when no rule matches
 	Cache   bool        `json:"cache"`
+	// FakeIPFilter lists suffixes that must never be answered with a synthetic
+	// address (mihomo's `fake-ip-filter`): a name only the local network can
+	// resolve would otherwise be handed a fake address and fail. A leading `+.`
+	// or `*.` is accepted and ignored, as the profile format writes both.
+	FakeIPFilter []string `json:"fake_ip_filter,omitempty"`
 }
 
 // DNSServer is one upstream resolver.

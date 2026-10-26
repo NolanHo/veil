@@ -32,7 +32,7 @@ func TestBypassFakeIP(t *testing.T) {
 		"nas.lan.", // trailing root dot
 	}
 	for _, host := range bypass {
-		if !bypassFakeIP(host) {
+		if !bypassFakeIP(host, nil) {
 			t.Errorf("bypassFakeIP(%q) = false, want true", host)
 		}
 	}
@@ -47,7 +47,7 @@ func TestBypassFakeIP(t *testing.T) {
 		"localhost.example.com",
 	}
 	for _, host := range fake {
-		if bypassFakeIP(host) {
+		if bypassFakeIP(host, nil) {
 			t.Errorf("bypassFakeIP(%q) = true, want false", host)
 		}
 	}
@@ -200,4 +200,18 @@ func TestFakeIPFilterFallsThroughToUpstream(t *testing.T) {
 		t.Fatalf("www.google.com reached the upstream (%d -> %d queries)", before, after)
 	}
 	t.Logf("LAN names answered upstream, www.google.com -> %v, upstream queries = %d", got, up.count())
+}
+
+// A configured list extends the built-in one; both the plain and the wildcard
+// spelling a profile uses must work.
+func TestBypassFakeIPHonoursConfiguredSuffixes(t *testing.T) {
+	configured := []string{"corp.example", "+.search.example", "*.lan2", " Mixed.Example. "}
+	for _, host := range []string{"nas.corp.example", "printer.search.example", "box.lan2", "x.mixed.example"} {
+		if !bypassFakeIP(host, configured) {
+			t.Errorf("bypassFakeIP(%q) = false, want true (configured suffix)", host)
+		}
+	}
+	if bypassFakeIP("www.google.com", configured) {
+		t.Error("a public name bypassed the fake pool because of a configured suffix")
+	}
 }
