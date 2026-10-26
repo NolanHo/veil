@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -79,7 +80,7 @@ func providerFilter(p config.ProxyProvider) (keep func(config.Node) bool, err er
 
 // providerNodes fetches one provider and returns the nodes it contributes, in the
 // provider's own document order, with Source already set to its name.
-func (s *Supervisor) providerNodes(p config.ProxyProvider) (nodes []config.Node, warnings []string, err error) {
+func (s *Supervisor) providerNodes(ctx context.Context, p config.ProxyProvider) (nodes []config.Node, warnings []string, err error) {
 	if ok, why := providerKind(p); !ok {
 		return nil, nil, fmt.Errorf("%s", why)
 	}
@@ -96,7 +97,7 @@ func (s *Supervisor) providerNodes(p config.ProxyProvider) (nodes []config.Node,
 	// The same fetch a subscription goes through: the same protected egress, the
 	// same timeout and body cap, and both the Clash document and the link-list
 	// door (providers serve either).
-	body, err := s.fetchSubscription(p.URL, p.Name)
+	body, err := s.fetchSubscription(ctx, p.URL, p.Name)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -155,9 +156,16 @@ func providerNodeCount(cfg *config.Config, name string) int {
 // statement that it is unwanted: another imported profile may well share it, and
 // deleting it would take that profile's group members with it. Removing a
 // provider is the UI's decision (see reconcileProviders).
-func mergeProviders(cfg *config.Config, providers []config.ProxyProvider) (changed []string) {
+func mergeProviders(cfg *config.Config, providers []config.ProxyProvider) (changed, warnings []string) {
 	for _, p := range providers {
 		if p.Name == "" {
+			continue
+		}
+		// A name is one owner: a provider that shares it with a subscription
+		// would have its nodes deleted by a subscription refresh, and deleting
+		// the provider would delete the subscription's nodes.
+		if err := providerNameFree(cfg, p.Name); err != nil {
+			warnings = append(warnings, fmt.Sprintf("provider %q: %v", p.Name, err))
 			continue
 		}
 		at := -1
@@ -178,7 +186,7 @@ func mergeProviders(cfg *config.Config, providers []config.ProxyProvider) (chang
 		cfg.Providers[at] = p
 		changed = append(changed, p.Name)
 	}
-	return changed
+	return changed, warnings
 }
 
 // groupKeeps applies a group's filter/exclude-filter to a provider node name.
@@ -424,7 +432,21 @@ func stillProvided(cfg *config.Config, fetched config.ProxyProvider) error {
 // renamed because another source holds it, a filter that kept nothing. They are
 // logged here as well, because the callers that run in the background have
 // nowhere else to put them.
-func (s *Supervisor) applyProvider(name string) (warnings []string, err error) {
+// providerNameFree reports whether name can own nodes: a provider and a
+// subscription share one Source label, so two owners under one name would delete
+// and replace each other's nodes. Subscriptions win — they are the older
+// concept and the user named them first.
+func providerNameFree(cfg *config.Config, name string) error {
+	for _, sub := range cfg.Subscriptions {
+		if sub.Name == name {
+			return fmt.Errorf(
+				"a subscription is already called %q; provider and subscription names share one namespace", name)
+		}
+	}
+	return nil
+}
+
+func (s *Supervisor) applyProvider(ctx context.Context, name string) (warnings []string, err error) {
 	s.mu.Lock()
 	stored := s.cfg.Providers
 	var p config.ProxyProvider
@@ -439,7 +461,7 @@ func (s *Supervisor) applyProvider(name string) (warnings []string, err error) {
 	if !found {
 		return nil, fmt.Errorf("provider %q is not defined", name)
 	}
-	nodes, fetchWarnings, err := s.providerNodes(p)
+	nodes, fetchWarnings, err := s.providerNodes(ctx, p)
 	if err != nil {
 		for _, w := range fetchWarnings {
 			s.log.Warnf("provider %s: %s", name, w)

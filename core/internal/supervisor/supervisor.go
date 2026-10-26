@@ -399,7 +399,7 @@ func (s *Supervisor) refreshDueSubscriptions(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			if _, err := s.applyProvider(name); err != nil {
+			if _, err := s.applyProvider(ctx, name); err != nil {
 				s.log.Warnf("scheduled refresh of provider %s failed: %v", name, err)
 				continue
 			}

@@ -348,7 +348,7 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 		}
 	}
 	for _, url := range p.URLs {
-		sub, err := s.fetchSubscription(url, p.Source)
+		sub, err := s.fetchSubscription(context.Background(), url, p.Source)
 		if err != nil {
 			res.Failed++
 			res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", url, err))
@@ -443,7 +443,11 @@ func (s *Supervisor) importRows(source string, nodes []config.Node, tables []rou
 		// rules replace every stored rule, and they carry source so a later
 		// subscription refresh knows they are not its to replace.
 		for _, t := range tables {
-			for _, name := range mergeProviders(cfg, t.Providers) {
+			names, pwarnings := mergeProviders(cfg, t.Providers)
+			for _, w := range pwarnings {
+				warn(w)
+			}
+			for _, name := range names {
 				fetch = append(fetch, name)
 			}
 			groups, rules, warnings := mergeRoutingTable(cfg, t, origin)
@@ -478,7 +482,7 @@ func (s *Supervisor) importRows(source string, nodes []config.Node, tables []rou
 		return res, err
 	}
 	for _, name := range dedupeNames(fetch) {
-		warnings, err := s.applyProvider(name)
+		warnings, err := s.applyProvider(context.Background(), name)
 		if err != nil {
 			msg := fmt.Sprintf("provider %q: %v", name, err)
 			warn(msg)
@@ -853,7 +857,7 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 	if url == "" {
 		return nil, fmt.Errorf("subscription %q not found", name)
 	}
-	fetched, err := s.fetchSubscription(url, name)
+	fetched, err := s.fetchSubscription(context.Background(), url, name)
 	if err != nil {
 		return nil, err
 	}
@@ -914,7 +918,11 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 		// (`proxy-providers:` in a Clash document), so a refresh merges those
 		// definitions too and remembers which ones changed. They are fetched
 		// below, outside the lock, like any other provider.
-		for _, pname := range mergeProviders(cfg, routing.Providers) {
+		pnames, pwarnings := mergeProviders(cfg, routing.Providers)
+		for _, w := range pwarnings {
+			s.log.Warnf("subscription %s: %s", name, w)
+		}
+		for _, pname := range pnames {
 			fetchedProviders = append(fetchedProviders, pname)
 		}
 		// Rebuild group membership for the refreshed subscription: members that
@@ -958,7 +966,7 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 		return nil, err
 	}
 	for _, pname := range dedupeNames(fetchedProviders) {
-		if _, err := s.applyProvider(pname); err != nil {
+		if _, err := s.applyProvider(ctx, pname); err != nil {
 			s.log.Warnf("subscription %s: provider %s: %v", name, pname, err)
 		}
 	}
@@ -1052,9 +1060,20 @@ type subscriptionBody struct {
 	Routing routingTable
 }
 
+// clashDocument reports whether the parse produced something worth importing as
+// a profile. A document may carry no inline proxies at all — the nodes can live
+// in a proxy-provider it names — and treating that as "not a Clash document"
+// sent it down the share-link path, where it yielded nothing.
+func clashDocument(c share.ClashConfig) bool {
+	return len(c.Nodes) > 0 || len(c.Providers) > 0 || len(c.Groups) > 0 || len(c.Rules) > 0
+}
+
 // fetchSubscription downloads and parses one subscription URL.
-func (s *Supervisor) fetchSubscription(url, name string) (subscriptionBody, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+func (s *Supervisor) fetchSubscription(ctx context.Context, url, name string) (subscriptionBody, error) {
+	// The caller's context, so stopping the supervisor cancels a fetch that is
+	// still in flight instead of letting it land in a configuration whose
+	// engine is already gone.
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -1090,11 +1109,11 @@ func (s *Supervisor) fetchSubscription(url, name string) (subscriptionBody, erro
 	// with its nodes; share.ParseSubscription is the node-only door and drops
 	// them. Providers serve the same document either bare or base64-wrapped, and
 	// only the bare form would be reached by the first attempt.
-	if c, cerrs := share.ParseClashConfig(body, name); len(c.Nodes) > 0 {
+	if c, cerrs := share.ParseClashConfig(body, name); clashDocument(c) {
 		return subscriptionBody{Nodes: c.Nodes, Routing: clashRouting(c, cerrs)}, nil
 	}
 	if decoded := decodeBase64(body); decoded != nil {
-		if c, cerrs := share.ParseClashConfig(decoded, name); len(c.Nodes) > 0 {
+		if c, cerrs := share.ParseClashConfig(decoded, name); clashDocument(c) {
 			return subscriptionBody{Nodes: c.Nodes, Routing: clashRouting(c, cerrs)}, nil
 		}
 	}
