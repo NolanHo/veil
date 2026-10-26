@@ -31,6 +31,10 @@ type Group struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// startOnce keeps a group from owning two probe loops when it is started
+	// both by the engine and, lazily, by the first connection that uses it.
+	startOnce sync.Once
+	parent    context.Context
 }
 
 type probe struct {
@@ -74,7 +78,24 @@ func (g *Group) Tag() string { return g.cfg.Tag }
 func (g *Group) Type() string { return "group:" + g.cfg.Type }
 
 // DialContext implements outbound.Outbound.
+// DialsLocally reports whether the member this group would use resolves names
+// on this device, so the router knows a fake address must be replaced first.
+func (g *Group) DialsLocally() bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.current < 0 || g.current >= len(g.members) {
+		return false
+	}
+	if ld, ok := g.members[g.current].(outbound.LocalDialer); ok {
+		return ld.DialsLocally()
+	}
+	return false
+}
+
 func (g *Group) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	// First use arms the probe loop; the group is about to carry traffic, so
+	// keeping its member latencies fresh is now worth the wakeups.
+	g.start(g.parent)
 	switch g.cfg.Type {
 	case "fallback":
 		var lastErr error
@@ -142,10 +163,23 @@ func (g *Group) selectTag(tag string) error {
 	return fmt.Errorf("%q is not a member of %q", tag, g.cfg.Tag)
 }
 
+// start launches the probe loop. Idempotent, and deferred until something
+// actually dials through a url-test/fallback group: an imported group that
+// nobody uses must not wake the device up every interval.
 func (g *Group) start(parent context.Context) {
 	if g.cfg.Type != "url-test" && g.cfg.Type != "fallback" {
 		return
 	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	g.startOnce.Do(func() {
+		g.parent = parent
+		g.launchProbeLoop(parent)
+	})
+}
+
+func (g *Group) launchProbeLoop(parent context.Context) {
 	g.ctx, g.cancel = context.WithCancel(parent)
 	g.wg.Add(1)
 	go func() {

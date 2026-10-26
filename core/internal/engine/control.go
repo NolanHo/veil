@@ -126,12 +126,6 @@ func (e *Engine) Reload(cfg config.Config) error {
 	for _, g := range oldGroups {
 		g.stop()
 	}
-	// Groups published by this reload need their own lifecycle: a url-test or
-	// fallback group that never starts never probes, so an imported group would
-	// stay frozen on its first member until the app restarts.
-	for _, g := range groups {
-		g.start(e.ctx)
-	}
 	if oldResolver != nil {
 		_ = oldResolver.Close()
 	}

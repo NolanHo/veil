@@ -31,10 +31,15 @@ type routingTable struct {
 // user's routing because of a typo, so a section that errored is downgraded to
 // "not stated" and the stored table survives.
 func clashRouting(c share.ClashConfig, errs []error) routingTable {
-	broken := func(keyword string) bool {
+	broken := func(keywords ...string) bool {
 		for _, err := range errs {
-			if err != nil && strings.Contains(err.Error(), keyword) {
-				return true
+			if err == nil {
+				continue
+			}
+			for _, k := range keywords {
+				if strings.Contains(err.Error(), k) {
+					return true
+				}
 			}
 		}
 		return false
@@ -45,10 +50,10 @@ func clashRouting(c share.ClashConfig, errs []error) routingTable {
 		GroupsProvided: c.GroupsProvided,
 		RulesProvided:  c.RulesProvided,
 	}
-	if t.GroupsProvided && len(c.Groups) == 0 && broken("clash proxy-groups") {
+	if t.GroupsProvided && len(c.Groups) == 0 && broken("clash group", "clash proxy-groups") {
 		t.GroupsProvided = false
 	}
-	if t.RulesProvided && len(c.Rules) == 0 && broken("clash rules") {
+	if t.RulesProvided && len(c.Rules) == 0 && broken("clash rule", "clash rules") {
 		t.RulesProvided = false
 	}
 	return t

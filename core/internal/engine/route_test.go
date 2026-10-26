@@ -35,7 +35,11 @@ func (o testOutbound) Type() string { return "test" }
 func (o testOutbound) DialContext(context.Context, string, string) (net.Conn, error) {
 	return nil, errors.New("test outbound: no dial")
 }
-func (o testOutbound) Close() error { return nil }
+
+// DialsLocally mirrors the built-in direct outbound: the router replaces a fake
+// address with the resolved one only for outbounds that resolve on this device.
+func (o testOutbound) DialsLocally() bool { return o.tag == "direct" }
+func (o testOutbound) Close() error       { return nil }
 
 // testDNS is a local UDP DNS server; it answers every A query with one address
 // and counts the A queries that reached it, which is how the tests prove how

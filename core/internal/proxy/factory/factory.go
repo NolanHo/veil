@@ -38,6 +38,9 @@ func (Direct) DialContext(ctx context.Context, network, address string) (net.Con
 // Close implements outbound.Outbound.
 func (Direct) Close() error { return nil }
 
+// DialsLocally implements outbound.LocalDialer: direct resolves the name here.
+func (Direct) DialsLocally() bool { return true }
+
 // Reject drops every connection.
 type Reject struct{}
 

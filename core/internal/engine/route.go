@@ -85,7 +85,11 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 	// connect to nothing (on device that shows up as "connected, this site does
 	// not load"). Dial the address the routing lookup produced instead. Proxied
 	// outbounds keep the name so the exit node stays the authority for DNS.
-	if fromFake && meta.Dst.IsValid() && ob.Tag() == "direct" {
+	dialsLocally := false
+	if ld, ok := ob.(outbound.LocalDialer); ok {
+		dialsLocally = ld.DialsLocally()
+	}
+	if fromFake && meta.Dst.IsValid() && dialsLocally {
 		target = netip.AddrPortFrom(meta.Dst.Unmap(), port).String()
 	}
 	return ob, action, target, nil

@@ -246,9 +246,10 @@ func (e *Engine) Start(ctx context.Context, tunFD int) error {
 	}
 
 	// 7. Group probes (running connections; no periodic wakeups when idle).
-	for _, g := range e.groups {
-		g.start(e.ctx)
-	}
+	// Probe loops are armed by the first connection that uses a group, not
+	// here: a url-test group nobody dials through has no business waking the
+	// device every interval (AGENTS.md invariant 7).
+	_ = e.groups
 
 	e.running = true
 	return nil

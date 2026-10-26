@@ -314,16 +314,16 @@ var cnPrefixes []netip.Prefix
 
 func init() {
 	fields := strings.Split(cnPrefixData, ",")
-	cnPrefixes = make([]netip.Prefix, 0, len(fields)+len(cnPrefixesCurated))
+	cnPrefixes = make([]netip.Prefix, 0, len(fields))
 	for _, f := range fields {
 		if p, err := netip.ParsePrefix(strings.TrimSpace(f)); err == nil {
 			cnPrefixes = append(cnPrefixes, p)
 		}
 	}
-	// Union with the curated table: it knows a few ranges the delegation file
-	// attributes to another country code (114DNS, for one), and a missing range
-	// means domestic traffic leaves through the proxy.
-	cnPrefixes = append(cnPrefixes, cnPrefixesCurated...)
+	// The generated delegation snapshot is authoritative: the hand-curated table
+	// this replaces carried whole /8s (14.0.0.0/8) that belong to Vietnam, India
+	// and Korea, so a union would re-introduce exactly the false positives the
+	// snapshot removes.
 }
 
 // mustPrefixes parses literal prefixes at package init. A malformed literal is

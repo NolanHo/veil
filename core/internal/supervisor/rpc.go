@@ -367,6 +367,10 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 			nodes[i].Source = source
 		}
 	}
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	restore := s.snapshot()
+
 	added, updated := s.mergeNodes(nodes)
 	res.Added, res.Updated = added, updated
 	// Routing last, and per document in input order: mergeNodes appends new nodes
@@ -390,6 +394,9 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 	cfg := s.cfg
 	s.mu.Unlock()
 	if err := s.persist(cfg); err != nil {
+		// The merge already touched the live config; put it back so a rejected
+		// import cannot poison every later write.
+		s.restore(restore)
 		return res, err
 	}
 	if err := s.reload(); err != nil {
@@ -488,6 +495,13 @@ func (s *Supervisor) snapshot() config.Config {
 	return cfg
 }
 
+// restore puts a snapshot back after a rejected write. The caller holds cfgMu.
+func (s *Supervisor) restore(cfg config.Config) {
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
+}
+
 // pruneRouting drops references to tags that no longer exist (a deleted node,
 // a node renamed by a subscription refresh) and groups left empty. Without this
 // a single delete makes the whole configuration invalid, which the UI can only
@@ -528,6 +542,8 @@ func pruneRouting(cfg *config.Config) {
 }
 
 func (s *Supervisor) Delete(tag string) error {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
 	cfg := s.snapshot()
 	out := make([]config.Node, 0, len(cfg.Nodes))
 	found := false
@@ -615,6 +631,8 @@ func (s *Supervisor) addSubscription(p rpc.SubParams) (any, error) {
 // updateSubscription re-fetches a subscription and replaces its nodes, and the
 // groups and rules that a Clash document among them carries.
 func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]state.NodeStatus, error) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
 	s.mu.Lock()
 	var sub *config.Subscription
 	for i := range s.cfg.Subscriptions {
@@ -703,6 +721,8 @@ func nodeSource(nodes []config.Node, tag string) string {
 }
 
 func (s *Supervisor) deleteSubscription(name string) error {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
 	cfg := s.snapshot()
 	subs := make([]config.Subscription, 0, len(cfg.Subscriptions))
 	found := false

@@ -30,6 +30,14 @@ type PacketConn interface {
 	SetDeadline(t time.Time) error
 }
 
+// LocalDialer is implemented by outbounds that resolve the destination address
+// on this device (the built-in direct), as opposed to proxies that hand the
+// name to the exit node. The router uses it to avoid handing a fake address
+// from the local DNS to a dial that would resolve it again.
+type LocalDialer interface {
+	DialsLocally() bool
+}
+
 // PacketOutbound is implemented by protocols able to relay UDP.
 type PacketOutbound interface {
 	// DialPacket opens a UDP association. address is the initial target and may

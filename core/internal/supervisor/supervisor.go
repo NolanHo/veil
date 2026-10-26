@@ -35,6 +35,10 @@ type Supervisor struct {
 	log     *logx.Logger
 
 	opMu sync.Mutex // serialises lifecycle operations
+	// cfgMu serialises configuration writers. A writer that merges into the
+	// live config and then fails validation used to leave memory and disk
+	// disagreeing, and every later write failed with the same error.
+	cfgMu sync.Mutex
 
 	mu        sync.Mutex
 	cfg       config.Config
