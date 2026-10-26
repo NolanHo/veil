@@ -33,7 +33,9 @@ type PacketConn interface {
 // LocalDialer is implemented by outbounds that resolve the destination address
 // on this device (the built-in direct), as opposed to proxies that hand the
 // name to the exit node. The router uses it to avoid handing a fake address
-// from the local DNS to a dial that would resolve it again.
+// from the local DNS to a dial that would resolve it again. A group answers for
+// the members it might dial: a selector names one, everything else answers yes
+// when any member dials locally.
 //
 // A policy group implements it too, and conservatively: it answers true only
 // when every member it could use dials locally, because the member that ends up

@@ -75,6 +75,116 @@ type routingOrigin struct {
 	OwnsTable bool
 }
 
+// resolveIncomingTags gives every row of one document a tag no other source
+// holds, and reports the renames as warnings.
+//
+// A tag is an outbound's identity: the engine's rule actions, the UI's group
+// list and the stored configuration all address a group or a node by it, and
+// Validate refuses two outbounds with one name. A document therefore cannot
+// reuse a tag another source already owns — a subscription whose node is also
+// pasted by hand used to make every refresh fail with `duplicate outbound tag`,
+// and two subscriptions defining `shared` made the second take the first's group
+// over, so deleting the second took the first's rules with it.
+//
+// The name a document gets is derived from its own tag and its source
+// ("x (subA)"), never from an arrival counter, so refreshing the same document
+// lands on the same tag. Rows the document keeps for itself are claimed before a
+// name is generated, so a generated name never takes a tag the document's own
+// rows refer to. Duplicate tags *within* one source keep the existing
+// replace-by-tag behaviour: those rows are one source correcting itself.
+//
+// A document without a source speaks for the user: its tags are the user's, and
+// a stored row of the same name is the row being replaced, so nothing is renamed.
+func resolveIncomingTags(cfg *config.Config, nodes []config.Node, tables []*routingTable, origin routingOrigin) []string {
+	if origin.Source == "" {
+		return nil
+	}
+	foreign := make(map[string]bool, len(cfg.Nodes)+len(cfg.Groups)+4)
+	// The built-ins are outbound names too, and Validate reserves them.
+	foreign["direct"] = true
+	foreign["reject"] = true
+	for _, n := range cfg.Nodes {
+		if n.Tag != "" && !fromSource(n.Source, origin.Source) {
+			foreign[n.Tag] = true
+		}
+	}
+	for _, g := range cfg.Groups {
+		if g.Tag != "" && !fromSource(g.Source, origin.Source) {
+			foreign[g.Tag] = true
+		}
+	}
+	claimed := make(map[string]bool, len(nodes)+len(cfg.Groups))
+	for _, n := range nodes {
+		if n.Tag != "" && !foreign[n.Tag] {
+			claimed[n.Tag] = true
+		}
+	}
+	for _, t := range tables {
+		for _, g := range t.Groups {
+			if g.Tag != "" && !foreign[g.Tag] {
+				claimed[g.Tag] = true
+			}
+		}
+	}
+	taken := func(tag string) bool { return foreign[tag] || claimed[tag] }
+
+	var warnings []string
+	renames := make(map[string]string)
+	rename := func(kind, tag string) string {
+		if tag == "" || !foreign[tag] {
+			return tag
+		}
+		next := disambiguatedTag(tag, origin.Source, taken)
+		claimed[next] = true
+		renames[tag] = next
+		warnings = append(warnings, fmt.Sprintf(
+			"%s %q is already used by another source; stored as %q", kind, tag, next))
+		return next
+	}
+
+	for i := range nodes {
+		nodes[i].Tag = rename("node", nodes[i].Tag)
+	}
+	for _, t := range tables {
+		for gi := range t.Groups {
+			t.Groups[gi].Tag = rename("group", t.Groups[gi].Tag)
+		}
+	}
+	// A document addresses its own rows by tag, so a rename has to follow the
+	// document: its group members and rule actions must point at its own rows,
+	// not at the other source's row that kept the name.
+	for _, t := range tables {
+		for gi := range t.Groups {
+			for mi, member := range t.Groups[gi].Members {
+				if to, ok := renames[member]; ok {
+					t.Groups[gi].Members[mi] = to
+				}
+			}
+		}
+		for ri := range t.Rules {
+			if to, ok := renames[t.Rules[ri].Action]; ok {
+				t.Rules[ri].Action = to
+			}
+		}
+	}
+	return warnings
+}
+
+// disambiguatedTag builds the name a row takes when its document tag is already
+// held by another source: `tag (source)`, or `tag (source)-2` when even that is
+// spoken for. Deterministic in its inputs, which is what makes a refresh stable.
+func disambiguatedTag(tag, source string, taken func(string) bool) string {
+	base := fmt.Sprintf("%s (%s)", tag, source)
+	if !taken(base) {
+		return base
+	}
+	for i := 2; ; i++ {
+		if candidate := fmt.Sprintf("%s-%d", base, i); !taken(candidate) {
+			return candidate
+		}
+	}
+}
+
 // mergeRoutingTable folds t into cfg and reports how many groups and rules the
 // document contributed.
 //
@@ -92,13 +202,40 @@ type routingOrigin struct {
 // document's own groups: the engine builds groups in one pass and drops a group
 // whose member does not exist yet, so a merged set can be broken by an order
 // that was valid in each half separately.
+//
+// The caller renames rows that collide with another source before merging (see
+// resolveIncomingTags), so a tag reaching this function belongs to exactly one
+// source: the same tag here means the same group is being redefined.
 func mergeRoutingTable(cfg *config.Config, t routingTable, origin routingOrigin) (groupCount, ruleCount int, warnings []string) {
 	if t.GroupsProvided {
 		if len(t.Groups) > 0 {
+			// The tag is the group's identity, not the document's: the user's pin
+			// (Selected) and the app's auto marker belong to the group, so a
+			// document that redefines a tag inherits them. Without this a refresh
+			// — and the refresh on start makes that a daily event — silently
+			// moved the user's own choice back to the provider's first member.
+			previous := make(map[string]config.Group, len(cfg.Groups))
+			for _, g := range cfg.Groups {
+				previous[g.Tag] = g
+			}
 			incoming := make([]config.Group, 0, len(t.Groups))
 			defined := make(map[string]bool, len(t.Groups))
 			for _, g := range t.Groups {
 				g.Source = origin.Source
+				if old, ok := previous[g.Tag]; ok {
+					g.Auto = g.Auto || old.Auto
+					switch {
+					case old.Selected == "":
+					case contains(g.Members, old.Selected):
+						g.Selected = old.Selected
+					default:
+						// A pin can only survive while its member does. Clearing it
+						// changes where traffic exits, so it is reported.
+						warnings = append(warnings, fmt.Sprintf(
+							"group %q: the selected member %q is no longer a member; the selection was cleared",
+							g.Tag, old.Selected))
+					}
+				}
 				incoming = append(incoming, g)
 				defined[g.Tag] = true
 			}
@@ -255,6 +392,28 @@ func mergeSourceRules(cfg *config.Config, source string, t routingTable) (ruleCo
 	}
 	cfg.Rules = out
 	return ruleCount, warnings
+}
+
+// clearDanglingSelections drops a pin whose member is no longer in the group and
+// reports it.
+//
+// The inheritance in mergeRoutingTable only sees the member list the document
+// states; the membership rebuild that follows a refresh can still remove a
+// member (the document lists a node it stopped defining). A pin that names
+// nothing would let the group fall back to another member without saying so, and
+// that is a change of where traffic exits.
+func clearDanglingSelections(cfg *config.Config) []string {
+	var warnings []string
+	for gi := range cfg.Groups {
+		g := &cfg.Groups[gi]
+		if g.Selected == "" || contains(g.Members, g.Selected) {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"group %q: the selected member %q is no longer a member; the selection was cleared", g.Tag, g.Selected))
+		g.Selected = ""
+	}
+	return warnings
 }
 
 // fromSource reports whether a stored row belongs to source. Nothing belongs to

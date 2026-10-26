@@ -9,9 +9,11 @@ import (
 //
 // Why: DNS must be answered at the *proxy* end. A client-side resolver (even
 // DoH) either gets poisoned answers or leaks which sites you visit. With
-// fake-IP the tunnel answers every A query with 198.18.x.x, and the engine
+// fake-IP the tunnel answers a name's A query with 198.18.x.x, and the engine
 // turns that address back into the domain, so the proxy resolves the name and
-// the local network never sees a real lookup.
+// the local network never sees a real lookup. Names the local network owns — a
+// NAS, a printer, anything under a home suffix — are excluded and take the
+// upstream path instead (see bypassFakeIP).
 //
 // One pool per engine, not one per resolver. A reload builds a new resolver but
 // keeps this object (see Engine.Reload and NewWithPool), which is what makes the

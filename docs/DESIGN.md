@@ -113,20 +113,37 @@ the system resolver, under fake-IP that answers with the same placeholder, and
 the connection dies somewhere the user cannot see. A proxied outbound keeps the
 name in every case — the exit node stays the authority for DNS.
 
-Whether an outbound dials locally is a group-level question, and groups answer it
-conservatively: `Group.DialsLocally` is true only when *every* member the group
-could use dials locally. A fallback or load-balance member is chosen at dial
-time and a url-test group switches on its own, so answering for `current` would
-substitute an address into flows that end up at a proxy member, costing the
-remote resolution the proxy exists for. The price is the mirror image: a group
-that mixes a direct and a proxied member answers false, so a fake-IP flow that
-lands on the direct member of such a group (a "select" group pinned to DIRECT,
-say) keeps its name and that local dial is back to asking the system resolver —
-the failure this section opened with. The group cannot tell which member carries
-a given connection, so it cannot answer more precisely than "all of them";
-answering per group type (select answers for `current`, the others for every
-member) would keep the pinned case working and is the alternative if this
-trade-off is ever reversed.
+Fake-IP does not answer for names the local network owns. A NAS (`nas`,
+`nas.lan`), a printer (`printer.local`) or a corporate host under `.internal`
+does not exist at the exit node, so a synthetic address is unanswerable: the
+public DoH upstreams return NXDOMAIN, and with a local dial the routing decision
+fails outright. Those names take the upstream path and get the real answer — or
+a real NXDOMAIN, which is a fact about the LAN rather than a pointer to an
+address nobody can reach. The list is mihomo's `fake-ip-filter` in its minimal
+form: single-label names (the local search suffix and mDNS own them), `.local`,
+`.lan`, `.internal`, `.home.arpa` (RFC 8375) and `.localhost` (RFC 6761).
+Everything else keeps the fake answer. There is no configuration for it yet —
+`config.DNSConfig` has no filter field, so there is nothing to merge with; a
+field added later should extend this list, with the configured entries winning.
+
+Whether an outbound dials locally is a group-level question, and the answer
+depends on the group type, because the type says whether `current` is a promise
+about the member that carries the next connection. A `select` group dials
+exactly the member it reports, so it answers for `current` — that is what keeps
+the ordinary "selector pinned to DIRECT" profile working. `fallback` and
+`load-balance` pick at dial time and may try any member, so they answer for the
+member set with an `any`: one member that dials locally is enough. The asymmetry
+is deliberate. A real address handed to a proxy member still works, because the
+exit node can dial an IP, while a fake address handed to a direct member is a
+dead end — that dial asks the system resolver and gets the placeholder back. A
+mixed fallback group therefore gives up the remote lookup the proxy member might
+have done and keeps the connection that lands on DIRECT; one substitution the
+proxy did not need costs a lookup, the broken direct dial costs the page.
+`url-test` keeps the older whole-set answer (`true` only when every member dials
+locally): it dials `current` like a selector, but its own probe loop can move
+`current` between the answer and the dial, so it cannot promise which member it
+reported, and a mixed url-test group still loses its DIRECT member under
+fake-IP.
 
 `no-resolve` is honoured in both directions. Such a rule never makes the router
 resolve, and it never matches an address the router looked up — it only sees a

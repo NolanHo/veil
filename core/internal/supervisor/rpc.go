@@ -373,13 +373,28 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 		if nodes[i].Source == "" {
 			nodes[i].Source = source
 		}
-		res.Tags = append(res.Tags, nodes[i].Tag)
 	}
 	// The merge runs on the transaction's own copy of the configuration, so a
 	// rejected import cannot leave half of itself in the live config.
 	err := s.commitConfig(func(cfg *config.Config) error {
+		// Tags first: one name is one outbound, so a document must not take a tag
+		// another source already holds. This rewrites the document's own member
+		// lists and rule actions along with it (see resolveIncomingTags).
+		origin := routingOrigin{Source: source, OwnsTable: true}
+		documents := make([]*routingTable, len(tables))
+		for i := range tables {
+			documents[i] = &tables[i]
+		}
+		for _, w := range resolveIncomingTags(cfg, nodes, documents, origin) {
+			if len(res.Warnings) < maxImportWarnings {
+				res.Warnings = append(res.Warnings, w)
+			}
+		}
 		added, updated := mergeNodes(cfg, nodes)
 		res.Added, res.Updated = added, updated
+		for _, n := range nodes {
+			res.Tags = append(res.Tags, n.Tag)
+		}
 		// Routing last, and per document in input order: mergeNodes appends new
 		// nodes to the generated groups, while a group a document curates
 		// replaces the stored one of the same tag. The counts are what the
@@ -388,7 +403,6 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 		// A pasted profile states a complete rule table, so it still owns it: its
 		// rules replace every stored rule, and they carry source so a later
 		// subscription refresh knows they are not its to replace.
-		origin := routingOrigin{Source: source, OwnsTable: true}
 		for _, t := range tables {
 			groups, rules, warnings := mergeRoutingTable(cfg, t, origin)
 			res.Groups += groups
@@ -718,6 +732,16 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 		if err := stillSubscribedAt(cfg, name, url); err != nil {
 			return err
 		}
+		// A tag this subscription used to own may have been taken by a source
+		// that arrived later (a pasted profile with the same node, a second
+		// subscription defining the same group), so the fetched rows are renamed
+		// the same way an import renames them. It runs before the stored rows are
+		// replaced, because a tag the subscription itself holds is free.
+		origin := routingOrigin{Source: name}
+		routing := fetched.Routing
+		for _, w := range resolveIncomingTags(cfg, nodes, []*routingTable{&routing}, origin) {
+			s.log.Warnf("subscription %s: %s", name, w)
+		}
 		kept := make([]config.Node, 0, len(cfg.Nodes)+len(nodes))
 		for _, n := range cfg.Nodes {
 			if n.Source != name {
@@ -742,7 +766,7 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 		// — which moves the subscription's rules across the ones the user wrote
 		// and changes which of two rules for the same domain matches first.
 		var warnings []string
-		groups, rules, warnings = mergeRoutingTable(cfg, fetched.Routing, routingOrigin{Source: name})
+		groups, rules, warnings = mergeRoutingTable(cfg, routing, origin)
 		for _, w := range warnings {
 			s.log.Warnf("subscription %s: %s", name, w)
 		}
@@ -772,6 +796,9 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 		// group can strand the groups above it; validation would refuse the whole
 		// refresh, so the references go with what they pointed at.
 		pruneRouting(cfg)
+		for _, w := range clearDanglingSelections(cfg) {
+			s.log.Warnf("subscription %s: %s", name, w)
+		}
 		return nil
 	})
 	if err != nil {

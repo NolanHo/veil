@@ -151,48 +151,52 @@ func (g *Group) Type() string { return "group:" + g.cfg.Type }
 // DialsLocally reports whether this group resolves names on this device, so the
 // router knows a fake address must be replaced before the dial.
 //
-// Conservative on purpose: true only when every member the group could use dials
-// locally. `current` is not a promise about who carries this connection —
-// load-balance rotates, fallback and url-test pick at dial time — so answering
-// for one member would substitute a real address into flows that then leave
-// through a proxy member, which costs exactly the remote DNS the proxy is
-// configured for.
+// The answer depends on the group type, because the type is what says whether
+// `current` is a promise about the member that carries the next connection:
 //
-// The trade-off is the under-substitution this answer cannot avoid: a group that
-// mixes a direct and a proxied member answers false, so a fake-IP flow that does
-// land on the direct member (a select group pinned to DIRECT) keeps its name and
-// that local dial asks the system resolver again, which is the failure mode the
-// router's substitution exists to prevent. Answering per group type — select
-// reports its `current` member, fallback/url-test/load-balance report all of them
-// — would keep that case working; this answers for the member set instead,
-// because even a select group's member can move between this decision and the
-// dial that follows it.
+//   - select dials exactly the member it reports, so it answers for `current`.
+//     That includes the common "selector pinned to DIRECT" profile, which must
+//     resolve the fake address locally.
+//   - fallback and load-balance walk the member list at dial time, so any of
+//     them may carry the connection and one local member is enough to answer
+//     true. This is deliberately not "all members": a real address handed to a
+//     proxy member still works — the exit node dials an IP — while a fake
+//     address handed to a direct member is a dead end, because that dial asks
+//     the system resolver and gets the placeholder back. Answering false for a
+//     mixed group would keep the remote lookup the proxy member might have done
+//     and lose the connection that lands on the direct one; a substitution the
+//     proxy did not need costs one lookup, the broken direct dial costs the page.
+//   - url-test dials `current` like select, but its own probe loop can move
+//     `current` between this answer and the dial that follows it, so it keeps
+//     the conservative whole-set answer: true only when every member dials
+//     locally. A mixed url-test group therefore still loses the DIRECT member
+//     under fake-IP; the alternative is claiming a member it may not dial.
 func (g *Group) DialsLocally() bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	if len(g.members) == 0 {
 		return false
 	}
-	// A select group dials exactly the member it reports, so its answer is the
-	// pinned member's answer — that includes the common "selector pinned to
-	// DIRECT" profile, which must still resolve the fake address locally.
-	// The other types pick per connection: url-test and fallback walk the list,
-	// load-balance rotates, so any of them may dial locally and the only safe
-	// answer is "yes" when they all do.
-	if g.cfg.Type == "select" {
+	switch g.cfg.Type {
+	case "select":
 		if g.current < 0 || g.current >= len(g.members) {
 			return false
 		}
 		ld, ok := g.members[g.current].(outbound.LocalDialer)
 		return ok && ld.DialsLocally()
-	}
-	for _, m := range g.members {
-		ld, ok := m.(outbound.LocalDialer)
-		if !ok || !ld.DialsLocally() {
-			return false
+	default:
+		// Everything but a selector picks per connection: url-test takes the
+		// fastest, fallback walks the list, load-balance rotates. Any of them may
+		// dial locally, and handing a fake address to a local dial is a dead
+		// connection, while handing a real address to a proxy only costs the
+		// remote resolution. So one local member is enough to answer yes.
+		for _, m := range g.members {
+			if ld, ok := m.(outbound.LocalDialer); ok && ld.DialsLocally() {
+				return true
+			}
 		}
+		return false
 	}
-	return true
 }
 
 // DialContext implements outbound.Outbound.

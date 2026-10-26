@@ -727,7 +727,11 @@ func (r *Resolver) Exchange(ctx context.Context, query []byte) ([]byte, error) {
 	// Fake-IP: answer locally with a synthetic address and let the proxy
 	// resolve the real name. No upstream query ever leaves the device, so
 	// domestic resolvers can neither poison the answer nor see the hostname.
-	if r.fakeOn {
+	//
+	// Names the local network owns are excluded (see bypassFakeIP): a NAS or a
+	// printer does not exist at the exit node, so it takes the upstream path and
+	// gets the real answer, or a real NXDOMAIN.
+	if r.fakeOn && !bypassFakeIP(q.Name) {
 		if q.Qtype == mdns.TypeAAAA {
 			// No AAAA: force clients onto IPv4 so every flow carries the
 			// domain back to us.

@@ -3,8 +3,10 @@ package engine
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -342,10 +344,10 @@ func TestSelfCheckDoesNotArmGroups(t *testing.T) {
 	t.Logf("self-check lines=%d armed=false probe results=%d", selfCheckLines(), measured)
 }
 
-// TestGroupDialsLocallyIsConservative is acceptance 5: a group only claims to
-// dial locally when every member it could use does, because the router must not
-// substitute an address into a flow a proxy member carries.
-func TestGroupDialsLocallyIsConservative(t *testing.T) {
+// TestGroupDialsLocallyPerType is acceptance 1: the answer depends on the group
+// type, because the group type is what says whether `current` is a promise about
+// the member that carries the next connection.
+func TestGroupDialsLocallyPerType(t *testing.T) {
 	direct, proxy, direct2 := localOutbound{newCounting("direct")}, newCounting("proxy"), localOutbound{newCounting("direct2")}
 	obs := map[string]outbound.Outbound{"direct": direct, "proxy": proxy, "direct2": direct2}
 
@@ -353,46 +355,68 @@ func TestGroupDialsLocallyIsConservative(t *testing.T) {
 		name    string
 		typ     string
 		members []string
+		pin     string // Group.Selected, the member a select group reports
 		want    bool
 	}{
-		{"fallback mixing direct and proxy", "fallback", []string{"direct", "proxy"}, false},
-		{"fallback all local", "fallback", []string{"direct", "direct2"}, true},
-		{"load-balance mixing direct and proxy", "load-balance", []string{"proxy", "direct"}, false},
-		{"url-test mixing direct and proxy", "url-test", []string{"direct", "proxy"}, false},
-		// A select group dials exactly the member it reports, so a mixed list
-		// answers for the member that is pinned (the first one here): pinning a
-		// selector to DIRECT is a normal Clash profile and used to dial nothing.
-		{"select mixing direct and proxy", "select", []string{"direct", "proxy"}, true},
-		{"select pinned past the direct member", "select", []string{"proxy", "direct"}, false},
-		{"select all local", "select", []string{"direct", "direct2"}, true},
+		// fallback and load-balance may dial any member, so one local member is
+		// enough for the claim: a fake address is a dead end for that member,
+		// while a real address handed to a proxy member still works.
+		{"fallback proxied then direct", "fallback", []string{"proxy", "direct"}, "", true},
+		{"fallback direct then proxied", "fallback", []string{"direct", "proxy"}, "", true},
+		{"fallback all local", "fallback", []string{"direct", "direct2"}, "", true},
+		{"fallback all proxied", "fallback", []string{"proxy"}, "", false},
+		{"load-balance proxied then direct", "load-balance", []string{"proxy", "direct"}, "", true},
+		{"load-balance direct then proxied", "load-balance", []string{"direct", "proxy"}, "", true},
+		{"load-balance all proxied", "load-balance", []string{"proxy"}, "", false},
+		// url-test takes the fastest member on every connection, so like fallback
+		// it may dial any of them: one local member is enough to require a real
+		// address (see Group.DialsLocally).
+		{"url-test direct then proxied", "url-test", []string{"direct", "proxy"}, "", true},
+		{"url-test all proxied", "url-test", []string{"proxy"}, "", false},
+		// A select group dials exactly the member it reports.
+		{"select pinned to direct", "select", []string{"direct", "proxy"}, "direct", true},
+		{"select pinned to proxied", "select", []string{"proxy", "direct"}, "proxy", false},
+		{"select defaults to the first member, a proxied one", "select", []string{"proxy", "direct"}, "", false},
+		{"select all local", "select", []string{"direct", "direct2"}, "", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			grp := mustGroup(t, config.Group{Tag: "g", Type: c.typ, Members: c.members}, obs)
+			grp := mustGroup(t, config.Group{Tag: "g", Type: c.typ, Members: c.members, Selected: c.pin}, obs)
 			got := grp.DialsLocally()
 			if got != c.want {
 				t.Fatalf("DialsLocally() = %v, want %v for %s over %v", got, c.want, c.typ, c.members)
 			}
-			t.Logf("%s %v: DialsLocally=%v", c.typ, c.members, got)
+			t.Logf("%s %v (pinned %q): DialsLocally=%v", c.typ, c.members, c.pin, got)
 		})
 	}
 
-	// A group of groups answers for the whole set it could use: every nested
-	// member dialing locally keeps the outer group's claim, one proxy anywhere in
-	// the chain drops it.
+	// A group of groups answers through the same rules: a select group reports
+	// the nested group it was pinned to, and a fallback group is satisfied by any
+	// member that resolves locally — including a nested group that does.
 	inner := mustGroup(t, config.Group{Tag: "inner", Type: "select", Members: []string{"direct", "direct2"}},
 		map[string]outbound.Outbound{"direct": direct, "direct2": direct2})
+	proxied := mustGroup(t, config.Group{Tag: "px", Type: "select", Members: []string{"proxy"}},
+		map[string]outbound.Outbound{"proxy": proxy})
 	nested := mustGroup(t, config.Group{Tag: "outer", Type: "select", Members: []string{"inner", "direct"}},
 		map[string]outbound.Outbound{"inner": inner, "direct": direct})
 	if !nested.DialsLocally() {
-		t.Fatal("a group of two local groups must dial locally")
+		t.Fatal("a select group pinned to a local group must dial locally")
 	}
-	mixed := mustGroup(t, config.Group{Tag: "outer-mixed", Type: "fallback", Members: []string{"inner", "proxy"}},
-		map[string]outbound.Outbound{"inner": inner, "proxy": proxy})
-	if mixed.DialsLocally() {
-		t.Fatal("a group holding a proxy member must not claim to dial locally")
+	if proxied.DialsLocally() {
+		t.Fatal("a group of proxies must not claim to dial locally")
 	}
-	t.Logf("nested all-local=%v nested with proxy=%v", nested.DialsLocally(), mixed.DialsLocally())
+	viaNested := mustGroup(t, config.Group{Tag: "fb-nested", Type: "fallback", Members: []string{"px", "inner"}},
+		map[string]outbound.Outbound{"px": proxied, "inner": inner})
+	if !viaNested.DialsLocally() {
+		t.Fatal("a fallback group holding a local group must claim to dial locally")
+	}
+	allProxied := mustGroup(t, config.Group{Tag: "fb-proxied", Type: "fallback", Members: []string{"px", "proxy"}},
+		map[string]outbound.Outbound{"px": proxied, "proxy": proxy})
+	if allProxied.DialsLocally() {
+		t.Fatal("a fallback group of proxies must not claim to dial locally")
+	}
+	t.Logf("nested all-local=%v proxied=%v fallback via nested=%v fallback all proxied=%v",
+		nested.DialsLocally(), proxied.DialsLocally(), viaNested.DialsLocally(), allProxied.DialsLocally())
 }
 
 // TestRouteFakeIPLocalDialWithoutAddressFails is acceptance 6: a fake address
@@ -433,4 +457,124 @@ func TestRouteFakeIPLocalDialWithoutAddressFails(t *testing.T) {
 		t.Fatalf("proxy route = %s/%q, want proxy with the hostname", ob.Tag(), target)
 	}
 	t.Logf("proxy route keeps %q", target)
+}
+
+// socketOutbound sends its dials to a real socket, the way the built-in direct
+// outbound does, and records every address it was asked for.
+type socketOutbound struct{ *countingOutbound }
+
+func (o socketOutbound) DialsLocally() bool { return true }
+
+func (o socketOutbound) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	o.record(address)
+	var d net.Dialer
+	return d.DialContext(ctx, network, address)
+}
+
+// echoServer accepts connections and sends back what it reads, so a test can
+// prove a connection reached a real socket at a specific address.
+type echoServer struct{ ln net.Listener }
+
+func newEchoServer(t *testing.T) *echoServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	s := &echoServer{ln: ln}
+	var wg sync.WaitGroup
+	wg.Add(1) // held for the accept loop's lifetime: Wait cannot return early
+	go func() {
+		defer wg.Done()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		wg.Wait()
+	})
+	return s
+}
+
+func (s *echoServer) port() int { return s.ln.Addr().(*net.TCPAddr).Port }
+
+// TestRouteFakeIPFallbackReachesDirect is acceptance 2: a fake-IP flow routed to
+// a fallback group that mixes a proxy member and DIRECT must still connect when
+// the proxy member fails. Whether the group claims to dial locally decides if
+// the fake address is replaced before the dial, and the direct member is the one
+// that cannot do anything with it.
+func TestRouteFakeIPFallbackReachesDirect(t *testing.T) {
+	echo := newEchoServer(t)
+	// The upstream resolves every name to the echo server's host address, and
+	// that address is what the direct member must be handed.
+	up := newTestDNS(t, netip.MustParseAddr("127.0.0.1"))
+	res := newTestResolver(t, up.addr())
+	const host = "fb.example.com"
+
+	proxy := newCounting("proxy")
+	grp := mustGroup(t, config.Group{
+		Tag:  "fb",
+		Type: "fallback",
+		// The probe URL keeps the probe loop this dial arms off the network.
+		URL:     probeURL,
+		Members: []string{"proxy", "direct"},
+	}, map[string]outbound.Outbound{
+		"proxy":  proxy,
+		"direct": socketOutbound{newCounting("direct")},
+	})
+
+	// The rule names a tag the engine already knows, then the group takes that
+	// outbound's place: route() resolves the tag to whatever is in the map.
+	eng := newRouteEngine(t, []config.Rule{{Type: "final", Action: "proxy"}}, res)
+	eng.outbounds["proxy"] = grp
+
+	// What the client dials after the tunnel answered its A query: the fake
+	// address, on the port it asked for.
+	target := net.JoinHostPort(fakeAddr(t, res, host).String(), strconv.Itoa(echo.port()))
+	ob, _, got, err := eng.route(context.Background(), "tcp", target)
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if ob.Tag() != "fb" {
+		t.Fatalf("route chose %q, want the fallback group", ob.Tag())
+	}
+	want := net.JoinHostPort("127.0.0.1", strconv.Itoa(echo.port()))
+	if got != want {
+		t.Fatalf("route target = %q, want the resolved address %q", got, want)
+	}
+
+	// Dial it the way the engine does. The proxy member refuses, so fallback
+	// walks on to DIRECT, and the echo proves the target was a real address
+	// rather than a name only our own DNS knows.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := ob.DialContext(ctx, "tcp", got)
+	if err != nil {
+		t.Fatalf("fallback dial to %q: %v", got, err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("veil")); err != nil {
+		t.Fatalf("echo write: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("echo read: %v", err)
+	}
+	if string(buf) != "veil" {
+		t.Fatalf("echo = %q, want %q", buf, "veil")
+	}
+	if n := proxy.count(want); n != 1 {
+		t.Fatalf("proxy member dialed %q %d times, want 1: fallback must try it first", want, n)
+	}
+	t.Logf("fake target %s -> routed to %q, proxy member failed, DIRECT echoed %q", target, got, buf)
 }
