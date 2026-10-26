@@ -92,6 +92,13 @@ type Transport struct {
 	ServiceName string            `json:"service_name,omitempty"`
 }
 
+// The generated selector. It is the only group this app creates on its own, and
+// the only one that takes new nodes as they are imported (see Group.Auto).
+const (
+	AutoGroupTag      = "proxy"
+	AutoGroupProbeURL = "http://cp.cloudflare.com/generate_204"
+)
+
 // Group is a user-visible collection of nodes with a selection policy.
 type Group struct {
 	Tag       string   `json:"tag"`
@@ -102,6 +109,13 @@ type Group struct {
 	Tolerance int      `json:"tolerance,omitempty"`
 	// Selected is the user's choice, meaningful for select groups.
 	Selected string `json:"selected,omitempty"`
+	// Auto marks a group this app generated rather than one the user or an
+	// imported profile defined. Only an auto group picks up nodes from a later
+	// import: a curated group's member list is itself the routing decision, so
+	// growing it behind the user's back would move where fallback/url-test send
+	// traffic. The field is omitted when false, so configurations written before
+	// it existed read as curated (see markLegacyAutoGroup for the one exception).
+	Auto bool `json:"auto,omitempty"`
 }
 
 // Rule is one routing rule. Rules are evaluated top to bottom; the first match
@@ -348,6 +362,7 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	migrateDNS(&c)
+	MarkGeneratedGroups(&c)
 	if err := c.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -418,6 +433,41 @@ func migrateDNS(c *Config) {
 		c.DNS.Servers = []DNSServer{{Tag: "local", Addr: "223.5.5.5:53"}}
 	}
 	c.DNS.Final = c.DNS.Servers[0].Tag
+}
+
+// MarkGeneratedGroups restores Group.Auto on the selector this app generates
+// when the marker is missing.
+//
+// Two producers lose the marker: a configuration file written before the field
+// existed, and an RPC client that round-trips a configuration through a model
+// without it (an upgrade would then silently freeze the group — it reads as
+// user-curated, so the next imported subscription adds nodes the selector never
+// shows, the same trap S19 closes for curated groups, from the other side).
+//
+// The match is deliberately exact (tag, type, probe URL, no pin, and a member
+// list that is precisely every node in order), because marking a group the user
+// curates would re-open the bug this field exists to close.
+func MarkGeneratedGroups(c *Config) {
+	for i := range c.Groups {
+		g := &c.Groups[i]
+		if g.Auto || g.Tag != AutoGroupTag || g.Type != "select" || g.URL != AutoGroupProbeURL ||
+			g.Selected != "" || g.Interval != 0 || g.Tolerance != 0 {
+			continue
+		}
+		if len(g.Members) != len(c.Nodes) || len(g.Members) == 0 {
+			continue
+		}
+		same := true
+		for j := range c.Nodes {
+			if g.Members[j] != c.Nodes[j].Tag {
+				same = false
+				break
+			}
+		}
+		if same {
+			g.Auto = true
+		}
+	}
 }
 
 // StripNodeName removes the "name" suffix conventions some subscriptions use.

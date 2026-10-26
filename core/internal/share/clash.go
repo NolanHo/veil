@@ -16,9 +16,13 @@ import (
 // one all-or-nothing step, so a single malformed entry would drop every
 // sibling. The entries are decoded one at a time in ParseClashConfig instead.
 type clashDocument struct {
-	Proxies     []yaml.Node `yaml:"proxies"`
-	ProxyGroups []yaml.Node `yaml:"proxy-groups"`
-	Rules       []yaml.Node `yaml:"rules"`
+	Proxies []yaml.Node `yaml:"proxies"`
+	// The two routing sections stay raw nodes so "the key is absent" and "the
+	// key is written with no entries" remain different facts: a bare `rules:`
+	// (null) or `rules: []` is a user clearing the table, while no `rules:` key
+	// at all says nothing about it. See ClashConfig.RulesProvided.
+	ProxyGroups yaml.Node `yaml:"proxy-groups"`
+	Rules       yaml.Node `yaml:"rules"`
 }
 
 type clashProxy struct {
@@ -66,6 +70,10 @@ type clashProxy struct {
 	// Reserved is the mihomo wireguard option that prepends bytes to every
 	// handshake packet. Raw so "present at all" is visible (see node()).
 	Reserved yaml.Node `yaml:"reserved"`
+	// AmneziaWG is mihomo's amnezia-wg-option block, which rewrites the handshake
+	// with junk packets. Raw for the same reason as Reserved: presence alone
+	// makes the peer behave differently, so it must be visible.
+	AmneziaWG yaml.Node `yaml:"amnezia-wg-option"`
 
 	// warnings collects what was dropped from an otherwise usable node; the
 	// caller reports them and keeps the node, unlike errors which skip it.
@@ -163,9 +171,16 @@ func ParseClashYAML(doc []byte, source string) ([]config.Node, []error) {
 	return c.Nodes, errs
 }
 
-// parseClashProxies decodes the `proxies:` entries one at a time into nodes.
-func parseClashProxies(d *clashDocument, source string, errs *[]error) []config.Node {
+// parseClashProxies decodes the `proxies:` entries one at a time into nodes. It
+// also returns the name map de-duplication produced: every proxy name that
+// resolved to a surviving node, including the spellings that were merged away.
+func parseClashProxies(d *clashDocument, source string, errs *[]error) ([]config.Node, map[string]string) {
 	var nodes []config.Node
+	// Clash names are one namespace: two different proxies cannot share a name,
+	// or every group member and rule action that spells it silently picks one of
+	// them while the other becomes unreachable. Clash itself rejects such a
+	// profile; here the later entry is skipped and reported.
+	owner := make(map[string]string, len(d.Proxies)) // display name -> identity
 	for i := range d.Proxies {
 		// One entry at a time: a malformed node costs that node, not the
 		// subscription. A document-level syntax error is still fatal above.
@@ -187,10 +202,31 @@ func parseClashProxies(d *clashDocument, source string, errs *[]error) []config.
 			continue // unsupported type
 		}
 		n.Remark = NormalizeTag(p.Name)
+		// DIRECT/REJECT are built-in outbounds here, and every group member or
+		// rule action that spells those names means the built-in. A node keeping
+		// the name could never be addressed, and for "direct"/"reject" its tag
+		// would also collide with the built-in tag in the stored configuration.
+		if builtin, reserved := clashBuiltinTag(n.Remark); reserved {
+			*errs = append(*errs, fmt.Errorf(
+				"share: clash proxy %d (%q): name collides with the built-in %q outbound", i, p.Name, builtin))
+			continue
+		}
+		if n.Remark != "" {
+			key := dedupeKey(n)
+			if prev, taken := owner[n.Remark]; taken && prev != key {
+				*errs = append(*errs, fmt.Errorf(
+					"share: clash proxy %d (%q): name is used by more than one node; kept the first", i, p.Name))
+				continue
+			}
+			if _, taken := owner[n.Remark]; !taken {
+				owner[n.Remark] = key
+			}
+		}
 		n.Source = source
 		nodes = append(nodes, n)
 	}
-	return finalize(nodes)
+	res := finalizeWithAliases(nodes)
+	return res.nodes, res.aliases
 }
 
 // node converts one Clash proxy entry into a config.Node. A zero Type means
@@ -243,6 +279,13 @@ func (p *clashProxy) node() (config.Node, error) {
 		// An empty list means "no reserved bytes", which is what we do.
 		if p.Reserved.Kind != 0 && !(p.Reserved.Kind == yaml.SequenceNode && len(p.Reserved.Content) == 0) {
 			return config.Node{}, fmt.Errorf("reserved is not supported by this build")
+		}
+		// amnezia-wg-option is the same class of problem: it rewrites the
+		// handshake (junk packets, custom header types), so a peer that needs it
+		// would never come up and a peer that does not would be told parameters
+		// this build never sends.
+		if p.AmneziaWG.Kind != 0 {
+			return config.Node{}, fmt.Errorf("amnezia-wg-option is not supported by this build")
 		}
 		allowed, err := listValue("allowed-ips", &p.AllowedIPs)
 		if err != nil {

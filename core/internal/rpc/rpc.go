@@ -73,12 +73,20 @@ type ImportParams struct {
 }
 
 // ImportResult summarises what was imported.
+//
+// Groups and Rules count what the imported document itself contributed to the
+// routing table (a node-only import contributes zero of each); they are not the
+// size of the stored table. Warnings lists routing problems that did not fail
+// the import, such as a group whose members close a cycle.
 type ImportResult struct {
-	Added   int      `json:"added"`
-	Updated int      `json:"updated"`
-	Failed  int      `json:"failed"`
-	Errors  []string `json:"errors,omitempty"`
-	Tags    []string `json:"tags,omitempty"`
+	Added    int      `json:"added"`
+	Updated  int      `json:"updated"`
+	Failed   int      `json:"failed"`
+	Groups   int      `json:"groups"`
+	Rules    int      `json:"rules"`
+	Errors   []string `json:"errors,omitempty"`
+	Warnings []string `json:"warnings,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
 }
 
 // SelectParams chooses the active member of a group.

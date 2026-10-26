@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -102,5 +105,84 @@ func TestWireGuardJSONRoundTrip(t *testing.T) {
 		got.Addresses[0] != want.Addresses[0] || len(got.AllowedIPs) != 1 ||
 		got.AllowedIPs[0] != want.AllowedIPs[0] || len(got.DNS) != 1 || got.DNS[0] != want.DNS[0] {
 		t.Fatalf("round-trip mismatch\ngot:  %+v\nwant: %+v", got, want)
+	}
+}
+
+// TestGroupAutoMarkerRoundTrip pins the on-disk name of the marker the importer
+// reads back: a generated group has to still read as generated after a restart,
+// or it stops collecting nodes (S19 seen from the other side).
+func TestGroupAutoMarkerRoundTrip(t *testing.T) {
+	cfg := Default()
+	cfg.Nodes = []Node{{Tag: "n1", Type: "direct"}}
+	cfg.Groups = []Group{
+		{Tag: AutoGroupTag, Type: "select", Auto: true, Members: []string{"n1"}, URL: AutoGroupProbeURL},
+		{Tag: "curated", Type: "select", Members: []string{"n1"}},
+	}
+	blob, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(blob, []byte(`"auto":true`)) {
+		t.Fatalf("marshalled config misses the auto marker:\n%s", blob)
+	}
+	if bytes.Contains(blob, []byte(`"curated":true`)) || strings.Count(string(blob), `"auto"`) != 1 {
+		t.Fatalf("the marker is not limited to the generated group:\n%s", blob)
+	}
+
+	var back Config
+	if err := json.Unmarshal(blob, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if err := back.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !back.Groups[0].Auto || back.Groups[1].Auto {
+		t.Fatalf("markers after round-trip = %v, %v", back.Groups[0].Auto, back.Groups[1].Auto)
+	}
+}
+
+// TestLoadMarksLegacyGeneratedSelector covers the upgrade path: a configuration
+// written before Group.Auto existed has no marker on the selector the app
+// generated, and reading it as user-curated would silently stop it from
+// collecting the next imported subscription.
+func TestLoadMarksLegacyGeneratedSelector(t *testing.T) {
+	write := func(t *testing.T, groups []Group) string {
+		t.Helper()
+		cfg := Default()
+		cfg.Nodes = []Node{{Tag: "a", Type: "direct"}, {Tag: "b", Type: "direct"}}
+		cfg.Groups = groups
+		blob, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, blob, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		return path
+	}
+
+	legacy := []Group{{
+		Tag: AutoGroupTag, Type: "select", Members: []string{"a", "b"}, URL: AutoGroupProbeURL,
+	}}
+	loaded, err := Load(write(t, legacy))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !loaded.Groups[0].Auto {
+		t.Fatal("the legacy generated selector was not re-marked, so the next import would not grow it")
+	}
+
+	// Same shape but a different membership: this is not what the app generates,
+	// so it stays curated and keeps its members.
+	lookalike := []Group{{
+		Tag: AutoGroupTag, Type: "select", Members: []string{"b", "a"}, URL: AutoGroupProbeURL,
+	}}
+	loaded, err = Load(write(t, lookalike))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.Groups[0].Auto {
+		t.Fatal("a hand-written selector with a different membership was marked auto")
 	}
 }

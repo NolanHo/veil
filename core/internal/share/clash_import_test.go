@@ -277,3 +277,44 @@ proxies:
 		t.Fatalf("errs = %v, want one about reserved", errs)
 	}
 }
+
+// TestClashWireGuardAmneziaOptionSkipped covers the other handshake-rewriting
+// field next to `reserved`: amnezia-wg-option adds junk packets and custom
+// header types, which the userspace bind does not send. Importing the peer
+// anyway would look successful and then differ from the config it came from, so
+// it is skipped with an error. An explicitly empty `reserved` list is the one
+// spelling that means "no reserved bytes" and still imports.
+func TestClashWireGuardAmneziaOptionSkipped(t *testing.T) {
+	doc := fmt.Sprintf(`
+proxies:
+  - name: "amnezia-peer"
+    type: wireguard
+    server: 115.191.57.106
+    port: 51820
+    ip: 10.173.91.13
+    private-key: %s
+    public-key: %s
+    allowed-ips: ['10.173.91.0/24']
+    amnezia-wg-option:
+      jc: 3
+      jmin: 10
+  - name: "plain-peer"
+    type: wireguard
+    server: 115.191.57.107
+    port: 51820
+    ip: 10.173.91.14
+    private-key: %s
+    public-key: %s
+    allowed-ips: ['10.173.91.0/24']
+    reserved: []
+`, testPrivKey, testPubKey, testPrivKey, testPubKey)
+
+	nodes, errs := ParseClashYAML([]byte(doc), "sub")
+	if len(nodes) != 1 {
+		t.Fatalf("nodes = %+v, want only the peer without amnezia options", nodes)
+	}
+	eq(t, "tag", nodes[0].Tag, "plain-peer")
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "amnezia-wg-option") {
+		t.Fatalf("errs = %v, want one about amnezia-wg-option", errs)
+	}
+}

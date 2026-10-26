@@ -10,6 +10,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"veil/internal/config"
+	"veil/internal/rules"
 )
 
 // ClashConfig is what a Clash/mihomo document contributes to a Veil
@@ -18,12 +19,38 @@ import (
 //
 // The three travel together because groups and rules name nodes by their Clash
 // `name`, and only the parser knows which tag a name became (tags are
-// normalised and de-duplicated, see finalize). Parsing them apart would leave
-// the caller guessing at that mapping.
+// normalised and de-duplicated, see finalizeWithAliases). Parsing them apart
+// would leave the caller guessing at that mapping.
 type ClashConfig struct {
 	Nodes  []config.Node
 	Groups []config.Group
 	Rules  []config.Rule
+
+	// RulesProvided reports whether the document had a `rules:` key at all.
+	// It is true for an explicit empty list — and for a bare `rules:` with no
+	// value under it — and false when the key is absent. Those are different
+	// statements, and an empty Rules slice alone cannot tell them apart. A
+	// consumer that merges the table should therefore read:
+	//   RulesProvided == false  -> the document is silent; keep the stored rules
+	//   RulesProvided == true   -> the document owns the table; replace it
+	//                              (an empty Rules here means "clear it")
+	// When the section's value has the wrong shape, the decode error is reported
+	// instead and Rules stays empty while the bit remains true. The same
+	// reasoning applies to GroupsProvided and Groups.
+	RulesProvided bool
+
+	// GroupsProvided reports whether the document had a `proxy-groups:` key at
+	// all; an explicit empty list means "no groups", an absent key means "the
+	// document says nothing about groups".
+	GroupsProvided bool
+}
+
+// clashNamespace is the name space of one imported document: every display name
+// that resolved to an outbound (nodes first, then the groups that survived),
+// plus the tags already taken by nodes.
+type clashNamespace struct {
+	names map[string]string // display name -> outbound tag
+	tags  map[string]bool   // tags already used by an imported node
 }
 
 // ParseClashConfig parses the routing half (`proxy-groups:` and `rules:`) of a
@@ -39,25 +66,52 @@ func ParseClashConfig(doc []byte, source string) (ClashConfig, []error) {
 		return ClashConfig{}, []error{fmt.Errorf("share: clash yaml: %w", err)}
 	}
 	var errs []error
-	nodes := parseClashProxies(&d, source, &errs)
+	nodes, aliases := parseClashProxies(&d, source, &errs)
 
-	// Clash names address nodes and groups alike; map every name to the tag it
-	// ended up with so members and rule actions resolve to the same outbound.
-	names := make(map[string]string, len(nodes))
+	// Clash names address nodes and groups alike; the namespace maps every name
+	// to the tag it ended up with so members and rule actions resolve to the same
+	// outbound. aliases already carries every proxy name, including the spellings
+	// de-duplication merged away.
+	ns := &clashNamespace{names: aliases, tags: make(map[string]bool, len(nodes))}
 	for _, n := range nodes {
-		if _, ok := names[n.Remark]; !ok {
-			names[n.Remark] = n.Tag
-		}
+		ns.tags[n.Tag] = true
 	}
-	groups := parseClashGroups(d.ProxyGroups, names, &errs)
-	for _, g := range groups {
-		if _, ok := names[g.Tag]; !ok {
-			names[g.Tag] = g.Tag
-		}
-	}
-	rules := parseClashRules(d.Rules, names, &errs)
 
-	return ClashConfig{Nodes: nodes, Groups: groups, Rules: rules}, errs
+	// A section whose value has the wrong shape does not take the document down:
+	// the rest of the profile still imports, and the presence bit still says the
+	// document tried to state that section.
+	groupEntries, groupsProvided, err := clashSection(&d.ProxyGroups)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("share: clash proxy-groups: %w", err))
+	}
+	groups := parseClashGroups(groupEntries, ns, &errs)
+
+	ruleEntries, rulesProvided, err := clashSection(&d.Rules)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("share: clash rules: %w", err))
+	}
+	rules := parseClashRules(ruleEntries, ns.names, &errs)
+
+	return ClashConfig{
+		Nodes:          nodes,
+		Groups:         groups,
+		Rules:          rules,
+		RulesProvided:  rulesProvided,
+		GroupsProvided: groupsProvided,
+	}, errs
+}
+
+// clashSection decodes one optional routing section. present reports whether the
+// key was written at all: a bare `rules:` (a YAML null) is present with no
+// entries, exactly like `rules: []`; only a missing key is absent.
+func clashSection(n *yaml.Node) (entries []yaml.Node, present bool, err error) {
+	if n.Kind == 0 {
+		return nil, false, nil
+	}
+	if err := n.Decode(&entries); err != nil {
+		return nil, true, err
+	}
+	return entries, true, nil
 }
 
 // clashGroup is one `proxy-groups:` entry.
@@ -91,7 +145,12 @@ const (
 // engine builds groups in order and drops one whose member outbound does not
 // exist yet, and real profiles routinely define the selector before the
 // url-test group it points at.
-func parseClashGroups(entries []yaml.Node, names map[string]string, errs *[]error) []config.Group {
+//
+// A group shares the outbound tag namespace with nodes and the DIRECT/REJECT
+// built-ins. A name that collides with either is skipped and reported: keeping
+// it would produce a tag that overwrites (or is shadowed by) the other outbound,
+// so references would silently land on the wrong destination.
+func parseClashGroups(entries []yaml.Node, ns *clashNamespace, errs *[]error) []config.Group {
 	plans := make([]*groupPlan, 0, len(entries))
 	index := make(map[string]int, len(entries)) // group tag -> plan index
 	for i := range entries {
@@ -123,6 +182,21 @@ func parseClashGroups(entries []yaml.Node, names map[string]string, errs *[]erro
 			*errs = append(*errs, fmt.Errorf("share: clash group %q: duplicate group name", tag))
 			continue
 		}
+		if builtin, reserved := clashBuiltinTag(tag); reserved {
+			*errs = append(*errs, fmt.Errorf(
+				"share: clash group %q: name collides with the built-in %q outbound", tag, builtin))
+			continue
+		}
+		if nodeTag, taken := ns.names[tag]; taken {
+			*errs = append(*errs, fmt.Errorf(
+				"share: clash group %q: name collides with the imported node %q", tag, nodeTag))
+			continue
+		}
+		if ns.tags[tag] {
+			*errs = append(*errs, fmt.Errorf(
+				"share: clash group %q: tag is already used by an imported node", tag))
+			continue
+		}
 		index[tag] = len(plans)
 		plans = append(plans, &groupPlan{
 			cfg: config.Group{
@@ -151,7 +225,7 @@ func parseClashGroups(entries []yaml.Node, names map[string]string, errs *[]erro
 		members := make([]string, 0, len(plan.names))
 		seen := make(map[string]bool, len(plan.names))
 		for _, name := range plan.names {
-			tag, isGroup, ok := clashMember(NormalizeTag(name), names, index)
+			tag, isGroup, ok := clashMember(NormalizeTag(name), ns.names, index)
 			if !ok {
 				*errs = append(*errs, fmt.Errorf(
 					"share: clash group %q: member %q is not in this configuration", plan.cfg.Tag, name))
@@ -184,6 +258,9 @@ func parseClashGroups(entries []yaml.Node, names map[string]string, errs *[]erro
 			return false
 		}
 		plan.cfg.Members = members
+		// The group is now an addressable outbound: a rule action naming it
+		// resolves to its tag, and a later group listing it is ordered after it.
+		ns.names[plan.cfg.Tag] = plan.cfg.Tag
 		state[i] = groupDone
 		out = append(out, plan.cfg)
 		return true
@@ -215,15 +292,30 @@ func clashGroupType(s string) (string, error) {
 	}
 }
 
+// clashBuiltinTag reports the engine outbound a policy name means. DIRECT and
+// REJECT(-DROP) are built-in outbounds here, not nodes, and every group member
+// or rule action that spells them means the built-in.
+//
+// This is also the reserved-name test for the import: a node or group with such
+// a name could never be addressed (the spelling always means the built-in), and
+// a "direct"/"reject" tag would additionally collide with the built-in tag in
+// the stored configuration, which validation rejects as a duplicate outbound.
+func clashBuiltinTag(name string) (string, bool) {
+	switch {
+	case strings.EqualFold(name, "DIRECT"):
+		return "direct", true
+	case strings.EqualFold(name, "REJECT"), strings.EqualFold(name, "REJECT-DROP"):
+		return "reject", true
+	}
+	return "", false
+}
+
 // clashMember resolves one group member name to an outbound tag. DIRECT and
 // REJECT are built-in outbounds in this build, and profiles put them in
 // selectors all the time ("手动切换: [auto, DIRECT]").
 func clashMember(key string, names map[string]string, groups map[string]int) (tag string, isGroup, ok bool) {
-	switch {
-	case strings.EqualFold(key, "DIRECT"):
-		return "direct", false, true
-	case strings.EqualFold(key, "REJECT"), strings.EqualFold(key, "REJECT-DROP"):
-		return "reject", false, true
+	if tag, builtin := clashBuiltinTag(key); builtin {
+		return tag, false, true
 	}
 	// Groups first: names also carries group tags once parsing is done, and a
 	// member that is a group must be reported as one so it is ordered in.
@@ -290,7 +382,12 @@ func parseClashRules(entries []yaml.Node, names map[string]string, errs *[]error
 				*errs = append(*errs, fmt.Errorf("share: clash rule %d (%q): %w", i, raw, errUnknownAction(fields[1])))
 				continue
 			}
-			out = append(out, config.Rule{Type: "final", Action: action})
+			rule := config.Rule{Type: "final", Action: action}
+			if err := clashRuleCompiles(rule); err != nil {
+				*errs = append(*errs, fmt.Errorf("share: clash rule %d (%q) does not compile: %w", i, raw, err))
+				continue
+			}
+			out = append(out, rule)
 			matched = true
 			continue
 		}
@@ -320,21 +417,37 @@ func parseClashRules(entries []yaml.Node, names map[string]string, errs *[]error
 				rule.NoResolve = true
 			}
 		}
+		if err := clashRuleCompiles(rule); err != nil {
+			*errs = append(*errs, fmt.Errorf("share: clash rule %d (%q) does not compile: %w", i, truncate(raw, 48), err))
+			continue
+		}
 		out = append(out, rule)
 	}
 	return out
 }
 
+// clashRuleCompiles asks the matcher itself whether one rule loads. The value
+// checks above cover the shapes this importer knows, but the engine compiles the
+// whole list in one pass: a rule that only fails there — an inverted port range,
+// a domain suffix that normalises to nothing, a process name that is just a path
+// separator — would import cleanly and then take the entire tunnel down at
+// start, with nothing in the UI to point at the rule.
+//
+// It runs the real compiler one rule at a time rather than restating its checks
+// here, so the two cannot drift apart.
+func clashRuleCompiles(r config.Rule) error {
+	_, err := rules.New([]config.Rule{r}, config.ModeRule, r.Action)
+	return err
+}
+
 // clashRuleAction maps a rule target to the tag the engine knows: a built-in,
 // or the tag an imported node/group ended up with.
 func clashRuleAction(name string, names map[string]string) (string, bool) {
-	switch {
-	case strings.EqualFold(name, "DIRECT"):
-		return "direct", true
-	case strings.EqualFold(name, "REJECT"), strings.EqualFold(name, "REJECT-DROP"):
-		return "reject", true
+	key := NormalizeTag(name)
+	if tag, builtin := clashBuiltinTag(key); builtin {
+		return tag, true
 	}
-	tag, ok := names[NormalizeTag(name)]
+	tag, ok := names[key]
 	return tag, ok
 }
 

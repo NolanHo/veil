@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -321,7 +322,7 @@ func (s *Supervisor) Delay(ctx context.Context, p rpc.DelayParams) (rpc.DelayRes
 // Import accepts pasted links, subscription bodies or Clash YAML.
 func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 	res := rpc.ImportResult{}
-	var parsed share.ClashConfig
+	var tables []routingTable
 	var nodes []config.Node
 	var errs []error
 	text := strings.TrimSpace(p.Text)
@@ -331,23 +332,25 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 			// Not a link list: a Clash document brings groups and rules too, and
 			// those are the only way to send one subnet to one node.
 			if c, e2 := share.ParseClashConfig([]byte(text), p.Source); len(c.Nodes) > 0 {
-				parsed, nodes, errs = c, c.Nodes, e2
+				nodes, errs = c.Nodes, e2
+				tables = append(tables, clashRouting(c, errs))
 			}
 		}
 	}
 	for _, url := range p.URLs {
-		n, err := s.fetchSubscription(url, p.Source)
+		sub, err := s.fetchSubscription(url, p.Source)
 		if err != nil {
 			res.Failed++
 			res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", url, err))
 			continue
 		}
-		nodes = append(nodes, n...)
+		nodes = append(nodes, sub.Nodes...)
+		tables = append(tables, sub.Routing)
 	}
 	for _, e := range errs {
 		if e != nil {
 			res.Failed++
-			if len(res.Errors) < 20 {
+			if len(res.Errors) < maxImportErrors {
 				res.Errors = append(res.Errors, e.Error())
 			}
 		}
@@ -366,11 +369,20 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 	}
 	added, updated := s.mergeNodes(nodes)
 	res.Added, res.Updated = added, updated
-	// Merge the routing table *after* the nodes: mergeNodes appends new nodes to
-	// every existing group, which is right for a plain subscription and wrong
-	// for a group the document curates. Replacing those groups afterwards keeps
-	// the document's membership without a second pass.
-	groups, rules := s.mergeRouting(parsed.Groups, parsed.Rules)
+	// Routing last, and per document in input order: mergeNodes appends new nodes
+	// to the generated groups, while a group a document curates replaces the
+	// stored one of the same tag. The counts are what the documents contributed,
+	// not the size of the resulting table.
+	for _, t := range tables {
+		groups, rules, warnings := s.mergeRouting(t)
+		res.Groups += groups
+		res.Rules += rules
+		for _, w := range warnings {
+			if len(res.Warnings) < maxImportWarnings {
+				res.Warnings = append(res.Warnings, w)
+			}
+		}
+	}
 	s.mu.Lock()
 	for _, n := range nodes {
 		res.Tags = append(res.Tags, n.Tag)
@@ -384,58 +396,16 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 		return res, err
 	}
 	s.log.Infof("imported %d new and %d updated node(s), %d group(s), %d rule(s)",
-		added, updated, groups, rules)
+		added, updated, res.Groups, res.Rules)
 	return res, nil
 }
 
-// mergeRouting folds an imported Clash routing table into the configuration: a
-// group or rule the document defines replaces the one already there, and
-// everything else is kept.
-//
-// Replaced entries move to the end in document order rather than staying in
-// place, because the two orders carry meaning: the engine builds groups in
-// order (a group listing another must come second) and rules are first-match.
-func (s *Supervisor) mergeRouting(groups []config.Group, rules []config.Rule) (groupCount, ruleCount int) {
-	if len(groups) == 0 && len(rules) == 0 {
-		return 0, 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(groups) > 0 {
-		incoming := make(map[string]bool, len(groups))
-		for _, g := range groups {
-			incoming[g.Tag] = true
-		}
-		kept := make([]config.Group, 0, len(s.cfg.Groups)+len(groups))
-		for _, g := range s.cfg.Groups {
-			if !incoming[g.Tag] {
-				kept = append(kept, g)
-			}
-		}
-		s.cfg.Groups = append(kept, groups...)
-	}
-	if len(rules) > 0 {
-		// A Clash profile's rule list is an ordered, complete table and first
-		// match wins. Merging imported rules *behind* the stock ones silently
-		// shadows them — the stock "geoip private → direct" beats an imported
-		// "ip-cidr 10.x → wireguard", which is exactly what a split tunnel needs
-		// to work. So the import replaces the table; the stock rules are starter
-		// content, not user intent.
-		s.cfg.Rules = rules
-		hasFinal := false
-		for _, r := range rules {
-			if r.Type == "final" {
-				hasFinal = true
-				break
-			}
-		}
-		if !hasFinal {
-			// Without a final rule unmatched traffic has no destination at all.
-			s.cfg.Rules = append(s.cfg.Rules, config.Rule{Type: "final"})
-		}
-	}
-	return len(groups), len(rules)
-}
+// Caps on the strings one import may return: a profile with a hundred broken
+// rules must not turn the RPC reply into a megabyte the UI has to render.
+const (
+	maxImportErrors   = 20
+	maxImportWarnings = 20
+)
 
 // mergeNodes inserts or replaces nodes by tag and ensures a default group.
 func (s *Supervisor) mergeNodes(nodes []config.Node) (added, updated int) {
@@ -455,25 +425,33 @@ func (s *Supervisor) mergeNodes(nodes []config.Node) (added, updated int) {
 		s.cfg.Nodes = append(s.cfg.Nodes, n)
 		added++
 	}
-	// Keep exactly one "proxy" select group containing every node, unless the
-	// user already defined groups explicitly.
+	// Keep one generated "proxy" select group containing every node, unless the
+	// user or an imported profile already defined groups.
 	if len(s.cfg.Groups) == 0 {
 		tags := make([]string, 0, len(s.cfg.Nodes))
 		for _, n := range s.cfg.Nodes {
 			tags = append(tags, n.Tag)
 		}
 		s.cfg.Groups = []config.Group{{
-			Tag:     "proxy",
+			Tag:     config.AutoGroupTag,
 			Type:    "select",
+			Auto:    true,
 			Members: tags,
-			URL:     "http://cp.cloudflare.com/generate_204",
+			URL:     config.AutoGroupProbeURL,
 		}}
-	} else {
-		for gi := range s.cfg.Groups {
-			for _, n := range nodes {
-				if !contains(s.cfg.Groups[gi].Members, n.Tag) {
-					s.cfg.Groups[gi].Members = append(s.cfg.Groups[gi].Members, n.Tag)
-				}
+		return added, updated
+	}
+	// Only generated groups take the new nodes. A curated group's membership *is*
+	// the routing decision — a fallback group listing [reject] must keep sending
+	// traffic to reject, and a url-test group listing two nodes must not start
+	// testing a third because a link was pasted later.
+	for gi := range s.cfg.Groups {
+		if !s.cfg.Groups[gi].Auto {
+			continue
+		}
+		for _, n := range nodes {
+			if !contains(s.cfg.Groups[gi].Members, n.Tag) {
+				s.cfg.Groups[gi].Members = append(s.cfg.Groups[gi].Members, n.Tag)
 			}
 		}
 	}
@@ -575,6 +553,12 @@ func (s *Supervisor) Delete(tag string) error {
 
 // SetConfig replaces the whole configuration.
 func (s *Supervisor) SetConfig(cfg config.Config) (state.Status, error) {
+	// A client that carries its own model of the configuration drops fields it
+	// does not know, and Group.Auto is one of them: without this, one save from
+	// the UI would turn the generated selector into a curated group that no longer
+	// collects imported nodes. The predicate only matches the exact shape this app
+	// generates (see config.MarkGeneratedGroups).
+	config.MarkGeneratedGroups(&cfg)
 	if err := cfg.Validate(); err != nil {
 		return s.Status(), err
 	}
@@ -628,7 +612,8 @@ func (s *Supervisor) addSubscription(p rpc.SubParams) (any, error) {
 	return s.Groups(), nil
 }
 
-// updateSubscription re-fetches a subscription and replaces its nodes.
+// updateSubscription re-fetches a subscription and replaces its nodes, and the
+// groups and rules that a Clash document among them carries.
 func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]state.NodeStatus, error) {
 	s.mu.Lock()
 	var sub *config.Subscription
@@ -641,10 +626,11 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 	if sub == nil {
 		return nil, fmt.Errorf("subscription %q not found", name)
 	}
-	nodes, err := s.fetchSubscription(sub.URL, name)
+	fetched, err := s.fetchSubscription(sub.URL, name)
 	if err != nil {
 		return nil, err
 	}
+	nodes := fetched.Nodes
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("subscription %q returned no nodes", name)
 	}
@@ -662,7 +648,11 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 			cfg.Subscriptions[i].Updated = time.Now().Unix()
 		}
 	}
-	// Rebuild group membership for the refreshed subscription.
+	// Rebuild group membership for the refreshed subscription: members that point
+	// at one of its nodes which is gone are dropped, and only the generated
+	// groups take the nodes that arrived. A curated group keeps the membership it
+	// was given — refreshing the node list must not move a fallback/url-test
+	// group's egress (see mergeNodes).
 	for gi := range cfg.Groups {
 		members := make([]string, 0, len(cfg.Groups[gi].Members)+len(nodes))
 		for _, m := range cfg.Groups[gi].Members {
@@ -670,21 +660,28 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 				members = append(members, m)
 			}
 		}
-		for _, n := range nodes {
-			if !contains(members, n.Tag) {
-				members = append(members, n.Tag)
+		if cfg.Groups[gi].Auto {
+			for _, n := range nodes {
+				if !contains(members, n.Tag) {
+					members = append(members, n.Tag)
+				}
 			}
 		}
 		cfg.Groups[gi].Members = members
 	}
 	pruneRouting(&cfg)
+	groups, rules, warnings := mergeRoutingTable(&cfg, fetched.Routing)
+	for _, w := range warnings {
+		s.log.Warnf("subscription %s: %s", name, w)
+	}
 	if err := s.persist(cfg); err != nil {
 		return nil, err
 	}
 	if err := s.reload(); err != nil {
 		return nil, err
 	}
-	s.log.Infof("subscription %s updated: %d node(s)", name, len(nodes))
+	s.log.Infof("subscription %s updated: %d node(s), %d group(s), %d rule(s)",
+		name, len(nodes), groups, rules)
 	return s.nodeStatuses(), nil
 }
 
@@ -734,40 +731,72 @@ func (s *Supervisor) deleteSubscription(name string) error {
 	return s.reload()
 }
 
+// subscriptionBody is one fetched subscription: the nodes it lists and, when the
+// body is a Clash document, the routing table that travels with them. A plain
+// share-link list has no routing half and leaves Routing unpopulated.
+type subscriptionBody struct {
+	Nodes   []config.Node
+	Routing routingTable
+}
+
 // fetchSubscription downloads and parses one subscription URL.
-func (s *Supervisor) fetchSubscription(url, name string) ([]config.Node, error) {
+func (s *Supervisor) fetchSubscription(url, name string) (subscriptionBody, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return subscriptionBody{}, err
 	}
 	req.Header.Set("User-Agent", version.UserAgent)
 	req.Header.Set("Accept", "*/*")
 	client := &http.Client{Timeout: 25 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return subscriptionBody{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
+		return subscriptionBody{}, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, err
+		return subscriptionBody{}, err
+	}
+	// The Clash door first, so a document's groups and rules are parsed together
+	// with its nodes; share.ParseSubscription is the node-only door and drops
+	// them. Providers serve the same document either bare or base64-wrapped, and
+	// only the bare form would be reached by the first attempt.
+	if c, cerrs := share.ParseClashConfig(body, name); len(c.Nodes) > 0 {
+		return subscriptionBody{Nodes: c.Nodes, Routing: clashRouting(c, cerrs)}, nil
+	}
+	if decoded := decodeBase64(body); decoded != nil {
+		if c, cerrs := share.ParseClashConfig(decoded, name); len(c.Nodes) > 0 {
+			return subscriptionBody{Nodes: c.Nodes, Routing: clashRouting(c, cerrs)}, nil
+		}
 	}
 	nodes, errs := share.ParseSubscription(body, name)
 	if len(nodes) == 0 {
-		if n2, _ := share.ParseClashYAML(body, name); len(n2) > 0 {
-			return n2, nil
-		}
 		if len(errs) > 0 {
-			return nil, errs[0]
+			return subscriptionBody{}, errs[0]
 		}
-		return nil, fmt.Errorf("empty subscription")
+		return subscriptionBody{}, fmt.Errorf("empty subscription")
 	}
-	return nodes, nil
+	return subscriptionBody{Nodes: nodes}, nil
+}
+
+// decodeBase64 decodes a subscription body that was served base64-wrapped,
+// trying the alphabets providers use. Nil means "not base64", which is the
+// answer for every plain link list.
+func decodeBase64(body []byte) []byte {
+	trimmed := strings.TrimSpace(strings.TrimPrefix(string(body), "\ufeff"))
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding,
+	} {
+		if out, err := enc.DecodeString(trimmed); err == nil && len(out) > 0 {
+			return out
+		}
+	}
+	return nil
 }
 
 // persist writes the configuration atomically.

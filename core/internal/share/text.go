@@ -115,22 +115,54 @@ func looksLikeClash(s string) bool {
 	return strings.Contains(head, "proxies:") || strings.HasPrefix(strings.TrimSpace(head), "proxy-groups:")
 }
 
+// finalizeResult is the product of de-duplication: the surviving nodes plus the
+// name bookkeeping de-duplication owes its callers.
+type finalizeResult struct {
+	nodes []config.Node
+	// aliases maps every input display name to the tag of the node it resolved
+	// to. Two entries that differ only in name (not in identity) become one node,
+	// so both spellings must keep resolving to that node: the Clash importer
+	// addresses outbounds by name, and a group or rule that used the dropped
+	// spelling would otherwise be discarded as a dangling reference.
+	//
+	// When distinct nodes share a name, the first one owns the alias; the
+	// duplicates still import under a suffixed tag (that is how a subscription
+	// with repeated display names behaves). The Clash importer rejects that case
+	// before de-duplication instead, because Clash names must be unique.
+	aliases map[string]string
+}
+
 // finalize de-duplicates nodes and makes every tag unique. Nodes are compared
 // on identity (see dedupeKey); the first occurrence wins. Repeated tags get a
 // "-2", "-3", ... suffix.
 func finalize(nodes []config.Node) []config.Node {
-	out := make([]config.Node, 0, len(nodes))
-	seen := make(map[string]bool, len(nodes))
+	return finalizeWithAliases(nodes).nodes
+}
+
+// finalizeWithAliases is finalize plus the identity→tag bookkeeping the Clash
+// importer needs: an entry merged by de-duplication must leave its name behind,
+// pointing at the node that survived.
+func finalizeWithAliases(nodes []config.Node) finalizeResult {
+	res := finalizeResult{
+		nodes:   make([]config.Node, 0, len(nodes)),
+		aliases: make(map[string]string, len(nodes)),
+	}
+	kept := make(map[string]string, len(nodes)) // identity -> surviving tag
 	tags := make(map[string]bool, len(nodes))
 
 	for _, n := range nodes {
 		key := dedupeKey(n)
-		if seen[key] {
+		name := NormalizeTag(n.Remark)
+		if tag, dup := kept[key]; dup {
+			if name != "" {
+				if _, ok := res.aliases[name]; !ok {
+					res.aliases[name] = tag
+				}
+			}
 			continue
 		}
-		seen[key] = true
 
-		base := NormalizeTag(n.Remark)
+		base := name
 		if base == "" {
 			base = fmt.Sprintf("%s-%s-%d", n.Type, n.Server, n.Port)
 		}
@@ -139,10 +171,16 @@ func finalize(nodes []config.Node) []config.Node {
 			tag = base + "-" + strconv.Itoa(i)
 		}
 		tags[tag] = true
+		if name != "" {
+			if _, ok := res.aliases[name]; !ok {
+				res.aliases[name] = tag
+			}
+		}
+		kept[key] = tag
 		n.Tag = tag
-		out = append(out, n)
+		res.nodes = append(res.nodes, n)
 	}
-	return out
+	return res
 }
 
 // dedupeKey builds the identity string used for duplicate detection.

@@ -359,3 +359,254 @@ func TestParseClashYAMLStillReturnsNodes(t *testing.T) {
 		t.Fatalf("node 0 = %+v", nodes[0])
 	}
 }
+
+// TestClashUncompilableRulesRejected is the S14 regression: these rules passed
+// the importer's own value checks but the matcher rejects them at compile time,
+// so the import reported success and the engine then refused the whole table at
+// start — the tunnel simply would not come up, with nothing pointing at a rule.
+func TestClashUncompilableRulesRejected(t *testing.T) {
+	doc := `
+proxies:
+  - name: "hy2-hk"
+    type: hysteria2
+    server: hk.example.net
+    port: 443
+    password: placeholder
+rules:
+  - DST-PORT,2000-1000,DIRECT
+  - DOMAIN-SUFFIX,.,DIRECT
+  - PROCESS-NAME,.,DIRECT
+  - DST-PORT,443,DIRECT
+  - MATCH,DIRECT
+`
+	cfg, errs := ParseClashConfig([]byte(doc), "clash")
+
+	want := []config.Rule{
+		{Type: "port", Value: "443", Action: "direct"},
+		{Type: "final", Action: "direct"},
+	}
+	if !reflect.DeepEqual(cfg.Rules, want) {
+		t.Fatalf("rules =\n%+v\nwant only the compilable rows\n%+v", cfg.Rules, want)
+	}
+	if len(errs) != 3 {
+		t.Fatalf("errs = %v, want one per uncompilable rule", errs)
+	}
+	joined := ""
+	for _, e := range errs {
+		joined += e.Error() + "\n"
+	}
+	for _, want := range []string{"2000-1000", "empty domain-suffix", "empty process name"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("errs = %v, want %q named", errs, want)
+		}
+	}
+
+	// The point of the check: what survived is loadable by the engine, and the
+	// stored configuration is valid.
+	if _, err := rules.New(cfg.Rules, config.ModeRule, "direct"); err != nil {
+		t.Fatalf("imported table must compile: %v", err)
+	}
+	c := config.Config{Nodes: cfg.Nodes, Groups: cfg.Groups, Rules: cfg.Rules}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+// TestClashDedupedNameResolves is the S17 regression: two proxies with different
+// names but the same connection identity are merged into one node. References
+// that use the merged-away spelling used to be discarded as dangling, silently
+// deleting the group members and rules the profile wrote.
+func TestClashDedupedNameResolves(t *testing.T) {
+	doc := `
+proxies:
+  - name: "hy2-hk"
+    type: hysteria2
+    server: hk.example.net
+    port: 443
+    password: placeholder
+  - name: "hy2-hk%20mirror"
+    type: hysteria2
+    server: hk.example.net
+    port: 443
+    password: placeholder
+proxy-groups:
+  - name: 手动切换
+    type: select
+    proxies: [hy2-hk mirror, DIRECT]
+rules:
+  - DOMAIN-SUFFIX,example.com,hy2-hk mirror
+  - MATCH,手动切换
+`
+	cfg, errs := ParseClashConfig([]byte(doc), "clash")
+	if len(errs) != 0 {
+		t.Fatalf("errs = %v, want none: a merged duplicate is not a problem", errs)
+	}
+	if len(cfg.Nodes) != 1 {
+		t.Fatalf("nodes = %+v, want the two entries merged by identity", cfg.Nodes)
+	}
+	eq(t, "tag", cfg.Nodes[0].Tag, "hy2-hk")
+
+	groups := groupByTag(t, cfg.Groups)
+	if got, want := groups["手动切换"].Members, []string{"hy2-hk", "direct"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("members = %v, want %v: the merged-away name must resolve", got, want)
+	}
+	wantRules := []config.Rule{
+		{Type: "domain-suffix", Value: "example.com", Action: "hy2-hk"},
+		{Type: "final", Action: "手动切换"},
+	}
+	if !reflect.DeepEqual(cfg.Rules, wantRules) {
+		t.Fatalf("rules =\n%+v\nwant\n%+v", cfg.Rules, wantRules)
+	}
+
+	c := config.Config{Nodes: cfg.Nodes, Groups: cfg.Groups, Rules: cfg.Rules}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if _, err := rules.New(cfg.Rules, config.ModeRule, "手动切换"); err != nil {
+		t.Fatalf("imported table must compile: %v", err)
+	}
+}
+
+// TestClashNameConflictsRejected is the S15 regression: nodes, groups and the
+// built-in outbounds share one tag namespace. A collision used to be imported
+// as-is, so either the stored configuration failed validation (duplicate tag) or
+// a reference silently resolved to the other outbound. Every conflict is skipped
+// and reported, and the entries that remain keep working.
+func TestClashNameConflictsRejected(t *testing.T) {
+	doc := `
+proxies:
+  - name: "node%20x"
+    type: hysteria2
+    server: a.example.net
+    port: 443
+    password: placeholder
+  - name: "reject"
+    type: hysteria2
+    server: b.example.net
+    port: 443
+    password: placeholder
+  - name: "node x"
+    type: trojan
+    server: c.example.net
+    port: 443
+    password: placeholder
+proxy-groups:
+  - name: "node x"
+    type: select
+    proxies: [node%20x, DIRECT]
+  - name: "DIRECT"
+    type: select
+    proxies: [node%20x]
+rules:
+  - DOMAIN,blocked.example,node x
+  - MATCH,node%20x
+`
+	cfg, errs := ParseClashConfig([]byte(doc), "clash")
+
+	// node%20x normalises to "node x" and owns the name; the trojan entry that
+	// spells the same name differently, the node named like a built-in, and both
+	// colliding groups are gone.
+	if len(cfg.Nodes) != 1 {
+		t.Fatalf("nodes = %+v, want only the first node named \"node x\"", cfg.Nodes)
+	}
+	eq(t, "tag", cfg.Nodes[0].Tag, "node x")
+	eq(t, "type", cfg.Nodes[0].Type, "hysteria2")
+	if len(cfg.Groups) != 0 {
+		t.Fatalf("groups = %+v, want none: both collide", cfg.Groups)
+	}
+
+	// References to the surviving name are not collateral damage: they still
+	// resolve to the node that kept it.
+	wantRules := []config.Rule{
+		{Type: "domain", Value: "blocked.example", Action: "node x"},
+		{Type: "final", Action: "node x"},
+	}
+	if !reflect.DeepEqual(cfg.Rules, wantRules) {
+		t.Fatalf("rules =\n%+v\nwant\n%+v", cfg.Rules, wantRules)
+	}
+
+	if len(errs) != 4 {
+		t.Fatalf("errs = %v, want one per conflict (node built-in, node duplicate, group vs node, group vs built-in)", errs)
+	}
+	joined := ""
+	for _, e := range errs {
+		joined += e.Error() + "\n"
+	}
+	for _, want := range []string{
+		`built-in "reject" outbound`,
+		"more than one node",
+		`collides with the imported node "node x"`,
+		`built-in "direct" outbound`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("errs = %v, want %q named", errs, want)
+		}
+	}
+
+	// Nothing was produced that overwrites another outbound.
+	c := config.Config{Nodes: cfg.Nodes, Groups: cfg.Groups, Rules: cfg.Rules}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+// TestClashRoutingPresenceFlags pins the S18 contract: an absent section and a
+// stated-but-empty one both produce an empty slice, and only the presence bit
+// tells a consumer which is which — "leave my table alone" versus "clear it".
+func TestClashRoutingPresenceFlags(t *testing.T) {
+	const base = `
+proxies:
+  - name: "hy2-hk"
+    type: hysteria2
+    server: hk.example.net
+    port: 443
+    password: placeholder
+`
+	cases := []struct {
+		name        string
+		doc         string
+		wantRules   bool
+		wantGroups  bool
+		wantRuleLen int
+		wantGrpLen  int
+	}{
+		{"absent", base, false, false, 0, 0},
+		{"explicit empty", base + "rules: []\nproxy-groups: []\n", true, true, 0, 0},
+		{"bare key", base + "rules:\nproxy-groups:\n", true, true, 0, 0},
+		{"non-empty", base + `rules:
+  - MATCH,DIRECT
+proxy-groups:
+  - name: g
+    type: select
+    proxies: [hy2-hk]
+`, true, true, 1, 1},
+	}
+	for _, c := range cases {
+		cfg, errs := ParseClashConfig([]byte(c.doc), "clash")
+		if len(errs) != 0 {
+			t.Fatalf("%s: errs = %v", c.name, errs)
+		}
+		if cfg.RulesProvided != c.wantRules {
+			t.Fatalf("%s: RulesProvided = %v, want %v", c.name, cfg.RulesProvided, c.wantRules)
+		}
+		if cfg.GroupsProvided != c.wantGroups {
+			t.Fatalf("%s: GroupsProvided = %v, want %v", c.name, cfg.GroupsProvided, c.wantGroups)
+		}
+		if len(cfg.Rules) != c.wantRuleLen {
+			t.Fatalf("%s: rules = %+v, want %d", c.name, cfg.Rules, c.wantRuleLen)
+		}
+		if len(cfg.Groups) != c.wantGrpLen {
+			t.Fatalf("%s: groups = %+v, want %d", c.name, cfg.Groups, c.wantGrpLen)
+		}
+	}
+
+	// A stated section with the wrong shape is reported, not fatal: the node
+	// still imports and the bit still says the document stated the section.
+	cfg, errs := ParseClashConfig([]byte(base+"rules: not-a-list\n"), "clash")
+	if !cfg.RulesProvided || len(cfg.Rules) != 0 || len(cfg.Nodes) != 1 {
+		t.Fatalf("cfg = %+v, want the node imported, an empty stated rule table", cfg)
+	}
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "rules") {
+		t.Fatalf("errs = %v, want one about the rules shape", errs)
+	}
+}
