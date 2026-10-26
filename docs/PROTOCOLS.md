@@ -42,6 +42,15 @@ with failover).
 DNS: UDP, TCP, DoT, DoH upstreams; per-server domain match; optional `detour`
 through a proxy; TTL cache with single-flight and negative caching.
 
+With fake-ip on, a domain reaches the router as a fake address. IP-based rules
+(`geoip`, `ip-cidr`, `ip-cidr6`) still need a real one, so the engine resolves
+the name through its own upstream at route time (3 s budget, 60 s/10 s cache,
+one lookup per name) while still dialing the hostname — the exit node stays the
+authority. A rule marked `no-resolve` neither triggers that lookup nor matches
+an address that came from one. `PROCESS-NAME` is importable but inert: the tun
+carries no uid, so it can never match until the platform supplies process
+identity.
+
 ## Share links
 
 ```
@@ -72,11 +81,16 @@ Paste any of these into 规则 → 导入. The importer also accepts:
   `fingerprint`), plus `proxy-groups:` (`select`, `url-test`, `fallback`,
   `load-balance`) and `rules:` (`DOMAIN*`, `IP-CIDR[6]`, `GEOIP`, `DST-PORT`,
   `NETWORK`, `PROCESS-NAME`, `MATCH`; `DIRECT`/`REJECT` map to the built-ins).
-  Groups are topologically ordered because the engine builds them in order, and
-  an imported rule table **replaces** the stock one (first match wins, so
-  appending behind the stock `geoip private → direct` would shadow a split
-  tunnel into a private range). `RULE-SET`/`GEOSITE` need external data and are
-  skipped with a reported error rather than silently ignored;
+  Groups are topologically ordered across the merged set because the engine
+  builds them in order, and an imported rule table **replaces** the stock one
+  (first match wins, so appending behind the stock `geoip private → direct`
+  would shadow a split tunnel into a private range). A document that says
+  `rules: []` clears the table; a document that says nothing keeps it; a
+  section that failed to parse keeps it too and reports the error. Only the
+  generated selector group grows when a later node link is imported — a
+  profile's own groups keep the members the profile gave them.
+  `RULE-SET`/`GEOSITE` need external data and are skipped with a reported error
+  rather than silently ignored;
 - a WireGuard `wg-quick` `.conf` (`[Interface]`/`[Peer]`, possibly repeated
   `Address`/`AllowedIPs`);
 - markdown-mangled links, e.g. `peer=[www.icloud.com](http://www.icloud.com)`,
