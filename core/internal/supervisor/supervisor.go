@@ -345,6 +345,42 @@ func (s *Supervisor) tryAttachTun() {
 }
 
 // startLoops launches the heartbeat and the health watchdog.
+// refreshDueSubscriptions refreshes the subscriptions whose update interval has
+// elapsed. It runs once per start rather than on a timer: a timer would wake a
+// device that is otherwise idle, and starting the tunnel is exactly when a
+// profile is expected to be current (Clash refreshes on launch too).
+func (s *Supervisor) refreshDueSubscriptions(ctx context.Context) {
+	s.mu.Lock()
+	var due []string
+	now := time.Now().Unix()
+	for _, sub := range s.cfg.Subscriptions {
+		if sub.Interval <= 0 || sub.URL == "" {
+			continue
+		}
+		if sub.Updated+int64(sub.Interval) <= now {
+			due = append(due, sub.Name)
+		}
+	}
+	s.mu.Unlock()
+	if len(due) == 0 {
+		return
+	}
+	s.loops.Add(1)
+	go func() {
+		defer s.loops.Done()
+		for _, name := range due {
+			if ctx.Err() != nil {
+				return
+			}
+			if _, err := s.updateSubscription(ctx, name); err != nil {
+				s.log.Warnf("scheduled refresh of subscription %s failed: %v", name, err)
+				continue
+			}
+			s.log.Infof("scheduled refresh of subscription %s done", name)
+		}
+	}()
+}
+
 func (s *Supervisor) startLoops(parent context.Context) {
 	s.mu.Lock()
 	if s.cancel != nil {
@@ -355,6 +391,7 @@ func (s *Supervisor) startLoops(parent context.Context) {
 	s.mu.Unlock()
 
 	s.heartbeat.Store(time.Now().UnixNano())
+	s.refreshDueSubscriptions(ctx)
 	s.loops.Add(2)
 	go func() {
 		defer s.loops.Done()

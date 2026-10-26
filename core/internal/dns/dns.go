@@ -38,6 +38,25 @@ func (r *Resolver) HostFor(ip netip.Addr) (string, bool) {
 	return r.fake.hostFor(ip)
 }
 
+// AdoptFakeIPs carries the previous resolver's domain mappings over. A reload
+// rebuilds the resolver; the device keeps talking to the addresses the old pool
+// handed out, so the new one has to know them too.
+func (r *Resolver) AdoptFakeIPs(old *Resolver) {
+	if r == nil || old == nil || r.fake == nil {
+		return
+	}
+	r.fake.adopt(old.fake)
+}
+
+// FakeFor returns the synthetic address this resolver uses for host,
+// allocating one if needed. It is the inverse of HostFor.
+func (r *Resolver) FakeFor(host string) netip.Addr {
+	if r == nil || r.fake == nil || !r.fakeOn {
+		return netip.Addr{}
+	}
+	return r.fake.ipFor(host)
+}
+
 // DisableFakeIP turns off synthetic answers (used by tests that exercise the
 // upstream path directly).
 func (r *Resolver) DisableFakeIP() { r.fakeOn = false }

@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"net"
+	"net/netip"
 	"testing"
 
 	"veil/internal/config"
@@ -159,5 +161,52 @@ func TestLazyDirectModeResolvesForTheDial(t *testing.T) {
 	}
 	if n := up.aCount.Load(); n != 1 {
 		t.Fatalf("A queries = %d, want 1", n)
+	}
+}
+
+// A reload rebuilds the resolver. Applications keep using the addresses the old
+// pool handed out, so the new resolver has to know the mapping — otherwise they
+// arrive as bare 198.18.x.x destinations.
+func TestReloadKeepsFakeIPMappings(t *testing.T) {
+	up := newTestDNS(t, cnAddr)
+	res := newTestResolver(t, up.addr())
+	eng := newRouteEngine(t, []config.Rule{
+		{Type: "geoip", Value: "cn", Action: "direct"},
+		{Type: "final", Action: "proxy"},
+	}, res)
+
+	fakeIP := res.FakeFor(cnName)
+	if !fakeIP.IsValid() {
+		t.Fatal("resolver handed out no fake address")
+	}
+
+	newRes := newTestResolver(t, up.addr())
+	newRes.AdoptFakeIPs(res)
+	eng.mu.Lock()
+	eng.resolver = newRes
+	eng.mu.Unlock()
+
+	ob, action, target, err := eng.route(context.Background(), "tcp", net.JoinHostPort(fakeIP.String(), "443"))
+	if err != nil {
+		t.Fatalf("route after reload: %v", err)
+	}
+	if ob.Tag() != "direct" || action.Rule != "geoip:cn" {
+		t.Fatalf("route = %s/%q, want direct/geoip:cn", ob.Tag(), action.Rule)
+	}
+	if want := cnAddr.String() + ":443"; target != want {
+		t.Fatalf("target = %q, want %q", target, want)
+	}
+}
+
+// An address inside the fake range whose domain nobody knows must fail loudly:
+// dialing it hangs on a benchmarking address until the deadline.
+func TestUnknownFakeAddressFailsFast(t *testing.T) {
+	up := newTestDNS(t, cnAddr)
+	res := newTestResolver(t, up.addr())
+	eng := newRouteEngine(t, []config.Rule{{Type: "final", Action: "proxy"}}, res)
+
+	orphan := netip.MustParseAddr("198.18.77.77")
+	if _, _, _, err := eng.route(context.Background(), "tcp", net.JoinHostPort(orphan.String(), "443")); err == nil {
+		t.Fatal("routing an unmapped fake address succeeded, want an error")
 	}
 }

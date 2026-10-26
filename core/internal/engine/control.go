@@ -102,6 +102,12 @@ func (e *Engine) Reload(cfg config.Config) error {
 			return fmt.Errorf("dns: %w", err)
 		}
 		r.SetDial(e.dnsDial)
+		// The device keeps using the addresses the previous pool handed out;
+		// without this they arrive as bare 198.18.x.x destinations.
+		e.mu.RLock()
+		prev := e.resolver
+		e.mu.RUnlock()
+		r.AdoptFakeIPs(prev)
 		resolver = r
 	}
 

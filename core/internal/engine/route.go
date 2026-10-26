@@ -33,6 +33,13 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 			ip = netip.Addr{}
 			target = net.JoinHostPort(name, fmt.Sprint(port))
 			fromFake = true
+		} else {
+			// Inside the fake range but nobody knows which name it stands for:
+			// the mapping died with an old resolver, or the app cached the
+			// address across a reload. Dialing it would connect to a
+			// benchmarking address and hang until the deadline.
+			return nil, rules.Action{}, target, fmt.Errorf(
+				"%s is a fake-IP address with no known domain; retry after a DNS lookup", target)
 		}
 	}
 

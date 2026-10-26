@@ -610,3 +610,23 @@ proxy-groups:
 		t.Fatalf("errs = %v, want one about the rules shape", errs)
 	}
 }
+
+// A profile that uses GEOIP,LAN to keep the local network direct must not end up
+// sending it through the proxy: mihomo's LAN code is the RFC1918 set, which this
+// build spells "private".
+func TestClashGeoIPLANMapsToPrivate(t *testing.T) {
+	doc := `
+proxies:
+  - {name: hk, type: hysteria2, server: hk.example.net, port: 443, password: pw}
+rules:
+  - GEOIP,LAN,DIRECT
+  - MATCH,hk
+`
+	c, errs := ParseClashConfig([]byte(doc), "test")
+	if len(errs) != 0 {
+		t.Fatalf("errors: %v", errs)
+	}
+	if len(c.Rules) == 0 || c.Rules[0].Type != "geoip" || c.Rules[0].Value != "private" {
+		t.Fatalf("rules = %+v, want GEOIP,LAN mapped to private", c.Rules)
+	}
+}

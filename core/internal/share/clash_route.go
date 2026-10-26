@@ -483,10 +483,15 @@ func clashRuleValue(typ, value string) (string, error) {
 		}
 		return value, nil
 	case "geoip":
-		v := strings.ToLower(value)
+		v := strings.ToLower(strings.TrimSpace(value))
 		switch v {
 		case "cn", "private":
 			return v, nil
+		case "lan":
+			// mihomo ships a "LAN" country code meaning RFC1918 space; a
+			// profile that relies on it to keep the local network direct would
+			// otherwise send it through the proxy.
+			return "private", nil
 		default:
 			return "", fmt.Errorf("geoip %q: this build only knows the built-in cn and private sets", value)
 		}

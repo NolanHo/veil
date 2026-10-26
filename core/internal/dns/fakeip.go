@@ -53,6 +53,39 @@ func (p *fakeIPPool) ipFor(host string) netip.Addr {
 	return netip.Addr{}
 }
 
+// adopt copies every mapping from old. A resolver reload builds a fresh pool,
+// and the applications on the device keep using the addresses the old pool
+// handed out — without this, those connections arrive as bare 198.18.x.x
+// destinations whose domain nobody knows any more.
+func (p *fakeIPPool) adopt(old *fakeIPPool) {
+	if old == nil {
+		return
+	}
+	old.mu.RLock()
+	byIP := make(map[netip.Addr]string, len(old.byIP))
+	byHost := make(map[string]netip.Addr, len(old.byHost))
+	for k, v := range old.byIP {
+		byIP[k] = v
+	}
+	for k, v := range old.byHost {
+		byHost[k] = v
+	}
+	next := old.next
+	old.mu.RUnlock()
+
+	p.mu.Lock()
+	for k, v := range byIP {
+		p.byIP[k] = v
+	}
+	for k, v := range byHost {
+		p.byHost[k] = v
+	}
+	if next > p.next {
+		p.next = next
+	}
+	p.mu.Unlock()
+}
+
 // hostFor resolves a fake address back to its domain.
 func (p *fakeIPPool) hostFor(ip netip.Addr) (string, bool) {
 	p.mu.RLock()
