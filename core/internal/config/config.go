@@ -134,6 +134,11 @@ type Group struct {
 	// have providers and no inline members; that is not an empty group (see
 	// Validate).
 	Providers []string `json:"providers,omitempty"`
+	// Filter and ExcludeFilter are the group's own regexes over provider node
+	// names. A profile writes them on the group, not on the provider, and uses
+	// them to split one airport into country selectors.
+	Filter        string `json:"filter,omitempty"`
+	ExcludeFilter string `json:"exclude_filter,omitempty"`
 }
 
 // ProxyProvider is one `proxy-providers:` entry of an imported Clash/mihomo

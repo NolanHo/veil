@@ -222,8 +222,10 @@ type clashGroup struct {
 	URL string    `yaml:"url"`
 	// Interval and tolerance are seconds/milliseconds written either bare or
 	// quoted, so they stay raw and go through asInt.
-	Interval  any `yaml:"interval"`
-	Tolerance any `yaml:"tolerance"`
+	Interval      any    `yaml:"interval"`
+	Tolerance     any    `yaml:"tolerance"`
+	Filter        string `yaml:"filter"`
+	ExcludeFilter string `yaml:"exclude-filter"`
 }
 
 // groupPlan is one group whose members are still Clash names.
@@ -344,6 +346,10 @@ func parseClashGroups(entries []yaml.Node, ns *clashNamespace, errs *[]error) []
 				Interval:  asInt(g.Interval),
 				Tolerance: asInt(g.Tolerance),
 				Providers: providers,
+				// mihomo writes these on the group and applies them to the
+				// provider's nodes only; they never filter an inline member.
+				Filter:        strings.TrimSpace(g.Filter),
+				ExcludeFilter: strings.TrimSpace(g.ExcludeFilter),
 			},
 			names: members,
 		})

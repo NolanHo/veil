@@ -181,6 +181,25 @@ func mergeProviders(cfg *config.Config, providers []config.ProxyProvider) (chang
 	return changed
 }
 
+// groupKeeps applies a group's filter/exclude-filter to a provider node name.
+// An invalid pattern keeps every node: the import already reported the regex
+// elsewhere, and silently emptying a group is worse than showing its nodes.
+func groupKeeps(g *config.Group, tag string) bool {
+	if s := strings.TrimSpace(g.Filter); s != "" {
+		re, err := regexp.Compile(s)
+		if err == nil && !re.MatchString(tag) {
+			return false
+		}
+	}
+	if s := strings.TrimSpace(g.ExcludeFilter); s != "" {
+		re, err := regexp.Compile(s)
+		if err == nil && re.MatchString(tag) {
+			return false
+		}
+	}
+	return true
+}
+
 // expandProviderGroups recomputes the provider half of every group's membership:
 // the inline members first, then each provider's nodes in the provider's own
 // order.
@@ -230,6 +249,11 @@ func expandProviderGroups(cfg *config.Config) (warnings []string) {
 			for i := range cfg.Nodes {
 				n := &cfg.Nodes[i]
 				if n.Source != name || seen[n.Tag] {
+					continue
+				}
+				// A profile splits one airport into country selectors with a
+				// regex on the group; it filters the provider's nodes only.
+				if !groupKeeps(g, n.Tag) {
 					continue
 				}
 				seen[n.Tag] = true

@@ -1,0 +1,213 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+profile:
+  store-selected: true
+  store-fake-ip: true
+proxy-providers:
+  PROXY:
+    proxy: mdev-hk
+    type: http
+    url: "http://provider.invalid/sub"
+    path: ./ssrdog.yml
+    interval: 86400
+    override:
+      udp: true
+    health-check:
+      enable: true
+      interval: 600
+      url: https://www.gstatic.com/generate_204
+proxies:
+  - name: "mdev-hk"
+    type: hysteria2
+    server: 203.0.113.10
+    port: 43127
+    password: example-password
+    obfs: salamander
+    obfs-password: "obfspw"
+    sni: hk.example.net
+    skip-cert-verify: false
+    fingerprint: "DE:5D:FC:E7:5C:E8:F3:D4:B9:E7:DD:C2:6E:A3:F4:94:9A:9A:29:F5:FB:D1:40:A6:53:0F:55:A4:FA:65:19:A9"
+  - name: "出口节点"
+    type: ss
+    server: 203.0.113.10
+    port: 3306
+    cipher: 2022-blake3-aes-256-gcm
+    password: example-password
+    udp: true
+    dialer-proxy: "mdev-hk"
+  - name: "日本家宽"
+    type: socks5
+    server: 203.0.113.10
+    port: 10001
+    username: example-username
+    password: example-password
+    udp: false
+    dialer-proxy: "日本家宽入口"
+  - name: "nolan-lab-wg"
+    type: wireguard
+    server: 203.0.113.10
+    port: 51820
+    ip: 10.9.0.13
+    private-key: example-private-key
+    public-key: example-public-key
+    allowed-ips: ['10.9.0.0/24']
+    mtu: 1280
+    udp: true
+  - name: "gz-relay-wg"
+    type: wireguard
+    server: 203.0.113.10
+    port: 51820
+    ip: 10.9.1.13
+    private-key: example-private-key
+    public-key: example-public-key
+    pre-shared-key: example-pre-shared-key
+    allowed-ips:
+      - 10.9.1.0/24
+    mtu: 1280
+    udp: true
+proxy-groups:
+  - name: "选择代理"
+    type: select
+    proxies:
+      - 出口包装
+      - 自动选择
+      - 香港
+      - 日本
+      - 美国
+      - 机场节点
+      - mdev-hk
+      - DIRECT
+  - name: "出口包装"
+    type: select
+    proxies:
+      - 出口节点
+  - name: "日本家宽入口"
+    type: select
+    proxies:
+      - mdev-hk
+      - 日本
+      - DIRECT
+  - name: "机场节点"
+    type: select
+    use:
+      - PROXY
+  - name: "自动选择"
+    type: fallback
+    use:
+      - PROXY
+    url: "http://provider.invalid/sub"
+    interval: 300
+    tolerance: 50
+    filter: "^((?!Traffic).)*$"
+  - name: 香港
+    type: fallback
+    use:
+      - PROXY
+    url: "http://provider.invalid/sub"
+    interval: 300
+    tolerance: 50
+    filter: "(?i)Hong Kong|香港|港"
+  - name: 日本
+    type: fallback
+    use:
+      - PROXY
+    url: "http://provider.invalid/sub"
+    interval: 300
+    tolerance: 50
+    filter: "(?i)日|jp|japan"
+  - name: 美国
+    type: fallback
+    use:
+      - PROXY
+    url: "http://provider.invalid/sub"
+    interval: 300
+    tolerance: 50
+    filter: "(?i)United States|美国|美"
+  - name: "Nolan-Lab"
+    type: select
+    proxies:
+      - nolan-lab-wg
+      - DIRECT
+  - name: "gz-relay"
+    type: select
+    proxies:
+      - gz-relay-wg
+      - DIRECT
+  - name: 漏网之鱼
+    type: select
+    proxies:
+      - 选择代理
+      - 出口包装
+      - 自动选择
+      - DIRECT
+rule-providers:
+  applications:
+    type: http
+    behavior: classical
+    format: yaml
+    url: "http://provider.invalid/sub"
+    path: ./ruleset/applications.yaml
+    interval: 604800
+    proxy: mdev-hk
+    size-limit: 65536
+  reject:
+    type: file
+    behavior: domain
+    format: mrs
+    path: ./ruleset/reject.mrs
+hosts:
+  "dsh-nolan.apeiria.cn": 203.0.113.10
+rules:
+  - DOMAIN,xbot.macaron.xin,Nolan-Lab
+  - DOMAIN,dsh-nolan.apeiria.cn,DIRECT
+  - IP-CIDR,203.0.113.10/32,DIRECT,no-resolve
+  - IP-CIDR,10.9.0.0/24,Nolan-Lab,no-resolve
+  - DOMAIN-SUFFIX,apeiria.cn,Nolan-Lab
+  - IP-CIDR,10.9.1.0/24,gz-relay,no-resolve
+  - 'DOMAIN-SUFFIX,openrouter.ai,出口包装'
+  - 'DOMAIN-SUFFIX,semanticscholar.org,出口包装'
+  - 'DOMAIN-SUFFIX,apxml.com,出口包装'
+  - 'DOMAIN-SUFFIX,anthropic.com,出口包装'
+  - 'DOMAIN-SUFFIX,claude.ai,出口包装'
+  - 'DOMAIN-SUFFIX,claudeusercontent.com,出口包装'
+  - 'DOMAIN-SUFFIX,openai.com,出口包装'
+  - 'DOMAIN-SUFFIX,chatgpt.com,出口包装'
+  - 'DOMAIN-SUFFIX,oaistatic.com,出口包装'
+  - 'DOMAIN-SUFFIX,oaiusercontent.com,出口包装'
+  - 'DOMAIN-SUFFIX,x.ai,出口包装'
+  - 'DOMAIN-SUFFIX,grok.com,出口包装'
+  - 'DOMAIN-KEYWORD,google,出口包装'
+  - 'DOMAIN-KEYWORD,cdn.wind.com.cn,DIRECT'
+  - 'DOMAIN-SUFFIX,ipdata.co,出口包装'
+  - 'DOMAIN,ping0.cc,出口包装'
+  - 'DOMAIN-SUFFIX,gstatic.com,出口包装'
+  - 'DOMAIN,pig.zwidi.cn,出口包装'
+  - 'DOMAIN-SUFFIX,dlsite.com,日本家宽'
+  - 'DOMAIN-SUFFIX,dlsite.jp,日本家宽'
+  - 'DOMAIN-SUFFIX,dlsite.cn,日本家宽'
+  - 'DOMAIN-SUFFIX,dlsite.net,日本家宽'
+  - 'DOMAIN-SUFFIX,dlsite.org,日本家宽'
+  - 'DOMAIN-SUFFIX,rcore-os.cn,选择代理'
+  - 'DOMAIN,cdn.steamusercontent.com,选择代理'
+  - 'DOMAIN-SUFFIX,steamusercontent.com,选择代理'
+  - 'DOMAIN-SUFFIX,x.com,出口包装'
+  - 'DOMAIN-SUFFIX,twitter.com,出口包装'
+  - 'DOMAIN-SUFFIX,poe.com,选择代理'
+  - 'DOMAIN-SUFFIX,poecdn.net,选择代理'
+  - 'DOMAIN-SUFFIX,acgbox.link,选择代理'
+  - 'DOMAIN-SUFFIX,openai-next.com,选择代理'
+  - 'DOMAIN,www.recaptcha.net,选择代理'
+  - 'DOMAIN,js4.blockelite.cn,DIRECT'
+  - 'PROCESS-NAME,aria2.exe,DIRECT'
+  - 'PROCESS-NAME,aria2c.exe,DIRECT'
+  - 'PROCESS-NAME,ssh.exe,DIRECT'
+  - 'RULE-SET,applications,DIRECT'
+  - 'DOMAIN,clash.razord.top,DIRECT'
+  - 'DOMAIN,yacd.haishan.me,DIRECT'
+  - 'RULE-SET,reject,REJECT'
+  - 'GEOIP,LAN,DIRECT'
+  - 'GEOIP,CN,DIRECT'
+  - 'MATCH,漏网之鱼'
