@@ -31,14 +31,21 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 
 	meta := rules.Meta{Network: network, Host: host, Dst: ip, Port: port}
 
+	// The matcher and the "does any IP rule exist" flag are replaced by SetMode
+	// and Reload. Publish them under the lock: the matcher object is immutable,
+	// but the pointer itself is not safe to read concurrently with a write.
+	e.mu.RLock()
+	router, needsIP, resolver := e.router, e.needsIP, e.resolver
+	e.mu.RUnlock()
+
 	// IP-based rules (geoip / CIDR) need an address. Resolve once, with a
 	// short budget, and keep the domain for the outbound dial so the remote
 	// side still sees the hostname.
 	// A fake address has no real IP by design: resolving it locally would leak
 	// the name and stall for seconds. The proxy resolves it.
-	if e.needsIP && host != "" && e.resolver != nil && !fromFake {
+	if needsIP && host != "" && resolver != nil && !fromFake {
 		rctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		addrs, err := e.resolver.Lookup(rctx, host)
+		addrs, err := resolver.Lookup(rctx, host)
 		cancel()
 		if err != nil {
 			e.log.Debugf("resolve %s for routing failed: %v", host, err)
@@ -47,7 +54,7 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 		}
 	}
 
-	action := e.router.Match(meta)
+	action := router.Match(meta)
 	if action.Reject {
 		return nil, action, target, outbound.ErrRejected
 	}

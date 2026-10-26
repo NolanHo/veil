@@ -41,12 +41,15 @@ scripts/build-core.sh          # produces entry/src/main/libs/arm64-v8a/libveil.
 ## Feature set
 
 - **Protocols**: VLESS (REALITY, XTLS-Vision), VMess (AEAD, alterId 0), Trojan,
-  Shadowsocks (AEAD-2022 + legacy AEAD), Hysteria2 (QUIC).
+  Shadowsocks (AEAD-2022 + legacy AEAD), Hysteria2 (QUIC, salamander obfs,
+  certificate pinning), WireGuard (userspace netstack, split tunnel by
+  `allowed-ips`).
 - **Transports**: TCP, TLS 1.3 with browser fingerprints, REALITY, WebSocket
   (early data), gRPC, HTTP/2.
 - **Import**: `vless://`, `vmess://` (standard JSON *and* legacy
   `base64(user@host:port?query)`), `trojan://`, `ss://` (SIP002), `hysteria2://`,
-  subscription URLs (base64 or plain), pasted Clash YAML.
+  subscription URLs (base64 or plain), pasted Clash YAML — proxies, plus
+  `proxy-groups` and `rules` — and a WireGuard `wg-quick` `.conf`.
 - **Routing**: ordered rules (domain / suffix / keyword / regex / CIDR / geoip /
   port / network / process / final), policy groups (select, url-test, fallback,
   load-balance), global/rule/direct modes.

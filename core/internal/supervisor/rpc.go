@@ -321,14 +321,17 @@ func (s *Supervisor) Delay(ctx context.Context, p rpc.DelayParams) (rpc.DelayRes
 // Import accepts pasted links, subscription bodies or Clash YAML.
 func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 	res := rpc.ImportResult{}
+	var parsed share.ClashConfig
 	var nodes []config.Node
 	var errs []error
 	text := strings.TrimSpace(p.Text)
 	if text != "" {
 		nodes, errs = share.ParseText(text)
 		if len(nodes) == 0 {
-			if n2, e2 := share.ParseClashYAML([]byte(text), p.Source); len(n2) > 0 {
-				nodes, errs = n2, e2
+			// Not a link list: a Clash document brings groups and rules too, and
+			// those are the only way to send one subnet to one node.
+			if c, e2 := share.ParseClashConfig([]byte(text), p.Source); len(c.Nodes) > 0 {
+				parsed, nodes, errs = c, c.Nodes, e2
 			}
 		}
 	}
@@ -363,6 +366,11 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 	}
 	added, updated := s.mergeNodes(nodes)
 	res.Added, res.Updated = added, updated
+	// Merge the routing table *after* the nodes: mergeNodes appends new nodes to
+	// every existing group, which is right for a plain subscription and wrong
+	// for a group the document curates. Replacing those groups afterwards keeps
+	// the document's membership without a second pass.
+	groups, rules := s.mergeRouting(parsed.Groups, parsed.Rules)
 	s.mu.Lock()
 	for _, n := range nodes {
 		res.Tags = append(res.Tags, n.Tag)
@@ -375,8 +383,58 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 	if err := s.reload(); err != nil {
 		return res, err
 	}
-	s.log.Infof("imported %d new and %d updated node(s)", added, updated)
+	s.log.Infof("imported %d new and %d updated node(s), %d group(s), %d rule(s)",
+		added, updated, groups, rules)
 	return res, nil
+}
+
+// mergeRouting folds an imported Clash routing table into the configuration: a
+// group or rule the document defines replaces the one already there, and
+// everything else is kept.
+//
+// Replaced entries move to the end in document order rather than staying in
+// place, because the two orders carry meaning: the engine builds groups in
+// order (a group listing another must come second) and rules are first-match.
+func (s *Supervisor) mergeRouting(groups []config.Group, rules []config.Rule) (groupCount, ruleCount int) {
+	if len(groups) == 0 && len(rules) == 0 {
+		return 0, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(groups) > 0 {
+		incoming := make(map[string]bool, len(groups))
+		for _, g := range groups {
+			incoming[g.Tag] = true
+		}
+		kept := make([]config.Group, 0, len(s.cfg.Groups)+len(groups))
+		for _, g := range s.cfg.Groups {
+			if !incoming[g.Tag] {
+				kept = append(kept, g)
+			}
+		}
+		s.cfg.Groups = append(kept, groups...)
+	}
+	if len(rules) > 0 {
+		// A Clash profile's rule list is an ordered, complete table and first
+		// match wins. Merging imported rules *behind* the stock ones silently
+		// shadows them — the stock "geoip private → direct" beats an imported
+		// "ip-cidr 10.x → wireguard", which is exactly what a split tunnel needs
+		// to work. So the import replaces the table; the stock rules are starter
+		// content, not user intent.
+		s.cfg.Rules = rules
+		hasFinal := false
+		for _, r := range rules {
+			if r.Type == "final" {
+				hasFinal = true
+				break
+			}
+		}
+		if !hasFinal {
+			// Without a final rule unmatched traffic has no destination at all.
+			s.cfg.Rules = append(s.cfg.Rules, config.Rule{Type: "final"})
+		}
+	}
+	return len(groups), len(rules)
 }
 
 // mergeNodes inserts or replaces nodes by tag and ensures a default group.
@@ -432,11 +490,70 @@ func contains(list []string, v string) bool {
 }
 
 // Delete removes a manually added node.
-func (s *Supervisor) Delete(tag string) error {
+// snapshot copies the live configuration deeply enough that a mutation can be
+// validated before it becomes visible. Editing s.cfg in place and validating
+// only inside persist() left memory and disk disagreeing whenever validation
+// failed, and every later write then failed with the same error until the user
+// reimported a profile.
+func (s *Supervisor) snapshot() config.Config {
 	s.mu.Lock()
-	out := s.cfg.Nodes[:0]
+	defer s.mu.Unlock()
+	cfg := s.cfg
+	cfg.Nodes = append([]config.Node(nil), s.cfg.Nodes...)
+	cfg.Groups = make([]config.Group, len(s.cfg.Groups))
+	for i, g := range s.cfg.Groups {
+		g.Members = append([]string(nil), g.Members...)
+		cfg.Groups[i] = g
+	}
+	cfg.Rules = append([]config.Rule(nil), s.cfg.Rules...)
+	cfg.Subscriptions = append([]config.Subscription(nil), s.cfg.Subscriptions...)
+	return cfg
+}
+
+// pruneRouting drops references to tags that no longer exist (a deleted node,
+// a node renamed by a subscription refresh) and groups left empty. Without this
+// a single delete makes the whole configuration invalid, which the UI can only
+// recover from by reimporting.
+func pruneRouting(cfg *config.Config) {
+	known := make(map[string]bool, len(cfg.Nodes)+len(cfg.Groups)+2)
+	for _, n := range cfg.Nodes {
+		known[n.Tag] = true
+	}
+	for _, g := range cfg.Groups {
+		known[g.Tag] = true
+	}
+	known["direct"] = true
+	known["reject"] = true
+	for gi := range cfg.Groups {
+		members := make([]string, 0, len(cfg.Groups[gi].Members))
+		for _, m := range cfg.Groups[gi].Members {
+			if known[m] {
+				members = append(members, m)
+			}
+		}
+		cfg.Groups[gi].Members = members
+	}
+	groups := make([]config.Group, 0, len(cfg.Groups))
+	for _, g := range cfg.Groups {
+		if len(g.Members) > 0 {
+			groups = append(groups, g)
+		}
+	}
+	cfg.Groups = groups
+	rules := make([]config.Rule, 0, len(cfg.Rules))
+	for _, r := range cfg.Rules {
+		if r.Action == "" || known[r.Action] {
+			rules = append(rules, r)
+		}
+	}
+	cfg.Rules = rules
+}
+
+func (s *Supervisor) Delete(tag string) error {
+	cfg := s.snapshot()
+	out := make([]config.Node, 0, len(cfg.Nodes))
 	found := false
-	for _, n := range s.cfg.Nodes {
+	for _, n := range cfg.Nodes {
 		if n.Tag == tag {
 			found = true
 			continue
@@ -444,21 +561,12 @@ func (s *Supervisor) Delete(tag string) error {
 		out = append(out, n)
 	}
 	if !found {
-		s.mu.Unlock()
 		return fmt.Errorf("node %q not found", tag)
 	}
-	s.cfg.Nodes = out
-	for gi := range s.cfg.Groups {
-		members := s.cfg.Groups[gi].Members[:0]
-		for _, m := range s.cfg.Groups[gi].Members {
-			if m != tag {
-				members = append(members, m)
-			}
-		}
-		s.cfg.Groups[gi].Members = members
-	}
-	cfg := s.cfg
-	s.mu.Unlock()
+	cfg.Nodes = out
+	// Rules and group members that pointed at this node die with it; keeping
+	// them would make the whole configuration invalid.
+	pruneRouting(&cfg)
 	if err := s.persist(cfg); err != nil {
 		return err
 	}
@@ -541,24 +649,24 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 		return nil, fmt.Errorf("subscription %q returned no nodes", name)
 	}
 
-	s.mu.Lock()
-	kept := s.cfg.Nodes[:0]
-	for _, n := range s.cfg.Nodes {
+	cfg := s.snapshot()
+	kept := make([]config.Node, 0, len(cfg.Nodes)+len(nodes))
+	for _, n := range cfg.Nodes {
 		if n.Source != name {
 			kept = append(kept, n)
 		}
 	}
-	s.cfg.Nodes = append(kept, nodes...)
-	for i := range s.cfg.Subscriptions {
-		if s.cfg.Subscriptions[i].Name == name {
-			s.cfg.Subscriptions[i].Updated = time.Now().Unix()
+	cfg.Nodes = append(kept, nodes...)
+	for i := range cfg.Subscriptions {
+		if cfg.Subscriptions[i].Name == name {
+			cfg.Subscriptions[i].Updated = time.Now().Unix()
 		}
 	}
 	// Rebuild group membership for the refreshed subscription.
-	for gi := range s.cfg.Groups {
-		members := make([]string, 0, len(s.cfg.Groups[gi].Members)+len(nodes))
-		for _, m := range s.cfg.Groups[gi].Members {
-			if nodeSource(s.cfg.Nodes, m) != name || contains(tagsOf(nodes), m) {
+	for gi := range cfg.Groups {
+		members := make([]string, 0, len(cfg.Groups[gi].Members)+len(nodes))
+		for _, m := range cfg.Groups[gi].Members {
+			if nodeSource(cfg.Nodes, m) != name || contains(tagsOf(nodes), m) {
 				members = append(members, m)
 			}
 		}
@@ -567,10 +675,9 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 				members = append(members, n.Tag)
 			}
 		}
-		s.cfg.Groups[gi].Members = members
+		cfg.Groups[gi].Members = members
 	}
-	cfg := s.cfg
-	s.mu.Unlock()
+	pruneRouting(&cfg)
 	if err := s.persist(cfg); err != nil {
 		return nil, err
 	}
@@ -599,10 +706,10 @@ func nodeSource(nodes []config.Node, tag string) string {
 }
 
 func (s *Supervisor) deleteSubscription(name string) error {
-	s.mu.Lock()
-	subs := s.cfg.Subscriptions[:0]
+	cfg := s.snapshot()
+	subs := make([]config.Subscription, 0, len(cfg.Subscriptions))
 	found := false
-	for _, sub := range s.cfg.Subscriptions {
+	for _, sub := range cfg.Subscriptions {
 		if sub.Name == name {
 			found = true
 			continue
@@ -610,28 +717,17 @@ func (s *Supervisor) deleteSubscription(name string) error {
 		subs = append(subs, sub)
 	}
 	if !found {
-		s.mu.Unlock()
 		return fmt.Errorf("subscription %q not found", name)
 	}
-	s.cfg.Subscriptions = subs
-	nodes := s.cfg.Nodes[:0]
-	for _, n := range s.cfg.Nodes {
+	cfg.Subscriptions = subs
+	nodes := make([]config.Node, 0, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
 		if n.Source != name {
 			nodes = append(nodes, n)
 		}
 	}
-	s.cfg.Nodes = nodes
-	for gi := range s.cfg.Groups {
-		members := s.cfg.Groups[gi].Members[:0]
-		for _, m := range s.cfg.Groups[gi].Members {
-			if nodeSource(s.cfg.Nodes, m) != name {
-				members = append(members, m)
-			}
-		}
-		s.cfg.Groups[gi].Members = members
-	}
-	cfg := s.cfg
-	s.mu.Unlock()
+	cfg.Nodes = nodes
+	pruneRouting(&cfg)
 	if err := s.persist(cfg); err != nil {
 		return err
 	}

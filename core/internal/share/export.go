@@ -30,6 +30,43 @@ func Link(n config.Node) (string, error) {
 	}
 }
 
+// uTLSName returns f when it is a uTLS profile name, and "" when it is a
+// certificate pin.
+//
+// TLS.Fingerprint carries both meanings by shape (a hex SHA-256 pins the
+// certificate, everything else names a ClientHello profile — see
+// config.TLS.Fingerprint). The `fp=` parameter of the TLS-minor links names a
+// uTLS profile, so a digest written there would make the next import hand it to
+// uTLS, where it fails at dial time. A pin travels in its own parameter instead:
+// hysteria2 links carry it as `pinSHA256` (see linkHysteria2), the key mihomo
+// reads, so nothing about the certificate constraint is lost.
+func uTLSName(f string) string {
+	if certPinShape(f) {
+		return ""
+	}
+	return f
+}
+
+// certPinShape reports whether f is a certificate pin rather than a uTLS name:
+// hex digits with the optional colons openssl and Clash print. The rule matches
+// the one the hysteria2 outbound applies when it authenticates a peer, so the
+// two always agree on which meaning a value has.
+func certPinShape(f string) bool {
+	// Trim first, like the hysteria2 outbound does: a value pasted with a
+	// trailing newline is a working pin at dial time, so the exporter must not
+	// treat it as "not a pin" and emit an insecure share link.
+	bare := strings.NewReplacer(":", "", " ", "", "\t", "", "\n", "", "\r", "").Replace(strings.TrimSpace(f))
+	if bare == "" {
+		return false
+	}
+	for _, c := range bare {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 // escape renders s as a URI component safe for userinfo and query values.
 func escape(s string) string {
 	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
@@ -107,7 +144,7 @@ func linkVLESS(n config.Node) (string, error) {
 			sni = n.Server
 		}
 		q.add("sni", sni)
-		q.add("fp", n.TLS.Fingerprint)
+		q.add("fp", uTLSName(n.TLS.Fingerprint))
 		q.addBool("allowInsecure", n.TLS.Insecure)
 		if len(n.TLS.ALPN) > 0 {
 			q.add("alpn", strings.Join(n.TLS.ALPN, ","))
@@ -188,7 +225,7 @@ func linkVMess(n config.Node) (string, error) {
 		m.TLS = "tls"
 		m.SNI = n.TLS.ServerName
 		m.Insecure = n.TLS.Insecure
-		m.Fp = n.TLS.Fingerprint
+		m.Fp = uTLSName(n.TLS.Fingerprint)
 		if len(n.TLS.ALPN) > 0 {
 			m.Alpn = strings.Join(n.TLS.ALPN, ",")
 		}
@@ -211,7 +248,7 @@ func linkTrojan(n config.Node) (string, error) {
 			sni = n.Server
 		}
 		q.add("sni", sni)
-		q.add("fp", n.TLS.Fingerprint)
+		q.add("fp", uTLSName(n.TLS.Fingerprint))
 		if len(n.TLS.ALPN) > 0 {
 			q.add("alpn", strings.Join(n.TLS.ALPN, ","))
 		}
@@ -254,6 +291,12 @@ func linkHysteria2(n config.Node) (string, error) {
 		}
 		q.add("sni", sni)
 		q.addBool("insecure", n.TLS.Insecure)
+		// A certificate pin is what authenticates a self-signed hysteria2 peer.
+		// Writing only insecure=1 would drop that constraint and leave the link
+		// authenticating nothing; pinSHA256 is the parameter mihomo reads.
+		if certPinShape(n.TLS.Fingerprint) {
+			q.add("pinSHA256", n.TLS.Fingerprint)
+		}
 	}
 	if n.Transport != nil {
 		if obfs := n.Transport.Headers["obfs"]; obfs != "" {
