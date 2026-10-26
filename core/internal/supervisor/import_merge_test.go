@@ -297,9 +297,9 @@ func TestSubscriptionAppliesGroupsAndRules(t *testing.T) {
 			t.Fatalf("homelab-wg members = %v", got)
 		}
 		wantRules := []config.Rule{
-			{Type: "domain-suffix", Value: "localhost", Action: "direct"},
-			{Type: "ip-cidr", Value: "127.0.0.1/32", Action: "homelab-wg", NoResolve: true},
-			{Type: "final", Action: "选择代理"},
+			{Type: "domain-suffix", Value: "localhost", Action: "direct", Source: "sub"},
+			{Type: "ip-cidr", Value: "127.0.0.1/32", Action: "homelab-wg", NoResolve: true, Source: "sub"},
+			{Type: "final", Action: "选择代理", Source: "sub"},
 		}
 		if got := sup.Config().Rules; !reflect.DeepEqual(got, wantRules) {
 			t.Fatalf("rules =\n%+v\nwant\n%+v", got, wantRules)
@@ -340,7 +340,7 @@ func TestSubscriptionAppliesGroupsAndRules(t *testing.T) {
 		if got := groupByTag(t, groups, "only-reject").Members; !reflect.DeepEqual(got, []string{"reject"}) {
 			t.Fatalf("only-reject members = %v", got)
 		}
-		wantRules := []config.Rule{{Type: "final", Action: "only-reject"}}
+		wantRules := []config.Rule{{Type: "final", Action: "only-reject", Source: "s"}}
 		if got := sup.Config().Rules; !reflect.DeepEqual(got, wantRules) {
 			t.Fatalf("rules after sub_update =\n%+v\nwant\n%+v", got, wantRules)
 		}

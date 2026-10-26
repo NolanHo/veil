@@ -178,11 +178,12 @@ func TestImportedClashRoutingReachesTheEngine(t *testing.T) {
 	}
 
 	// Stored routing table: the imported rules replace the actionless final and
-	// keep their own order (first match wins).
+	// keep their own order (first match wins). Each row carries the import's
+	// source, which is what keeps a later subscription refresh away from it.
 	wantRules := []config.Rule{
-		{Type: "domain-suffix", Value: "localhost", Action: "direct"},
-		{Type: "ip-cidr", Value: "127.0.0.1/32", Action: "homelab-wg", NoResolve: true},
-		{Type: "final", Action: "选择代理"},
+		{Type: "domain-suffix", Value: "localhost", Action: "direct", Source: "clash"},
+		{Type: "ip-cidr", Value: "127.0.0.1/32", Action: "homelab-wg", NoResolve: true, Source: "clash"},
+		{Type: "final", Action: "选择代理", Source: "clash"},
 	}
 	if got := sup.Config().Rules; !reflect.DeepEqual(got, wantRules) {
 		t.Fatalf("rules =\n%+v\nwant\n%+v", got, wantRules)

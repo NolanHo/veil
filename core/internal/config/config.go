@@ -116,6 +116,11 @@ type Group struct {
 	// traffic. The field is omitted when false, so configurations written before
 	// it existed read as curated (see markLegacyAutoGroup for the one exception).
 	Auto bool `json:"auto,omitempty"`
+	// Source names the document this group came from: a subscription's name, or
+	// the source a pasted profile was imported under. A refresh replaces the
+	// groups of its own source only, and a group with no source was built by hand
+	// and is never touched.
+	Source string `json:"source,omitempty"`
 }
 
 // Rule is one routing rule. Rules are evaluated top to bottom; the first match
@@ -126,6 +131,13 @@ type Rule struct {
 	Value     string `json:"value"`
 	Action    string `json:"action"`
 	NoResolve bool   `json:"no_resolve,omitempty"`
+	// Source names the document this rule came from, exactly like Node.Source
+	// and Group.Source: a subscription's name, or the source a pasted profile
+	// was imported under. A refresh replaces the rules of its own source only;
+	// a rule with no source was written by hand (that is also how every rule in
+	// a configuration written before the field existed reads) and is never
+	// removed by a subscription refresh.
+	Source string `json:"source,omitempty"`
 }
 
 // DNSConfig configures name resolution for both the app and the tunnel.

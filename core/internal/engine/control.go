@@ -150,8 +150,12 @@ func (e *Engine) Reload(cfg config.Config) error {
 		time.AfterFunc(2*time.Minute, func() { closeAll(retired) })
 	}
 	if len(buildErrs) > 0 {
+		// A group appears here only when *every* member was unavailable (a
+		// partially broken group is built without the missing members and warns
+		// from newGroup), so this line and lastErr are what tells the user the
+		// group itself is gone and rules naming it fall back to the default.
 		e.setLastErr("reload: " + fmt.Sprint(buildErrs))
-		e.log.Warnf("reload kept %d broken outbound(s): %v", len(buildErrs), buildErrs)
+		e.log.Warnf("reload could not build %d outbound(s), the rest keep working: %v", len(buildErrs), buildErrs)
 	}
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,26 +46,81 @@ type probe struct {
 
 const defaultProbeURL = "http://cp.cloudflare.com/generate_204"
 
+// skippedMember is a member the group could not use, with the reason it could
+// not: the warning names what to repair, and the error of a group that loses
+// every member repeats the same facts.
+type skippedMember struct {
+	tag    string
+	reason string
+}
+
+func (s skippedMember) String() string { return fmt.Sprintf("%q (%s)", s.tag, s.reason) }
+
+// unavailableReason explains why tag cannot be used as a member of this group:
+// the map either has no such outbound at all, or has one the group does not
+// list. A tag the configuration still lists but whose outbound failed to build
+// is a different repair than a tag that names nothing at all (a deleted node, a
+// misspelling, or a group that failed earlier in the same pass).
+func unavailableReason(tag string, obs map[string]outbound.Outbound, nodes map[string]config.Node) string {
+	if _, built := obs[tag]; built {
+		return "it is not a member of this group"
+	}
+	if _, known := nodes[tag]; known {
+		return "its outbound failed to build"
+	}
+	return "no node or group has this tag"
+}
+
 func newGroup(g config.Group, obs map[string]outbound.Outbound, nodes map[string]config.Node, log *logx.Logger) (*Group, error) {
 	if g.Type == "" {
 		g.Type = "select"
 	}
 	grp := &Group{cfg: g, nodes: nodes, log: log, delays: make(map[string]probe)}
+	// A member that cannot be built is skipped, not fatal. Dropping the whole
+	// group made every rule that named it fall back to the default outbound
+	// without saying so: a subnet meant for WireGuard quietly left through the
+	// proxy because one unrelated tag in the subscription was stale. Clash skips
+	// the member that is gone and keeps the group working; so do we, and the
+	// skip is logged with the member and the reason. Only a group with nothing
+	// left is refused, and then the error carries the same detail.
+	var skipped []string
 	for _, tag := range g.Members {
 		ob, ok := obs[tag]
 		if !ok {
-			return nil, fmt.Errorf("member %q not found", tag)
+			sk := skippedMember{tag: tag, reason: unavailableReason(tag, obs, nodes)}
+			skipped = append(skipped, sk.String())
+			if log != nil {
+				log.Warnf("group %s skips member %s", g.Tag, sk)
+			}
+			continue
 		}
 		grp.members = append(grp.members, ob)
 	}
 	if len(grp.members) == 0 {
-		return nil, errors.New("no members")
+		if len(skipped) == 0 {
+			return nil, errors.New("no members")
+		}
+		return nil, fmt.Errorf("all members unavailable: %s", strings.Join(skipped, ", "))
 	}
 	// Restore the pinned selection.
 	if g.Selected != "" {
+		pinned := false
 		for i, m := range grp.members {
 			if m.Tag() == g.Selected {
 				grp.current = i
+				pinned = true
+				break
+			}
+		}
+		if !pinned {
+			// The pin names a member this build had to skip. Route through the
+			// first member that does exist, but keep g.cfg.Selected: the pin is
+			// the user's choice, and the next reload restores it once the member
+			// is importable again instead of leaving the group on the fallback.
+			grp.current = 0
+			if log != nil {
+				log.Warnf("group %s: selected member %s is unavailable, using %q",
+					g.Tag, skippedMember{tag: g.Selected, reason: unavailableReason(g.Selected, obs, nodes)}, grp.members[0].Tag())
 			}
 		}
 	}

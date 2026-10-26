@@ -229,13 +229,28 @@ func (c compiled) match(m Meta) bool {
 	return false
 }
 
+// needsAddr reports whether c is an IP rule that wants an address while m
+// carries none the matcher could judge it by, i.e. whether the walk has to
+// resolve the name before c can be decided. A `no-resolve` rule never says yes:
+// asking for a lookup is exactly what the flag forbids.
+func (c compiled) needsAddr(m Meta) bool {
+	if c.noResolve || m.Dst.IsValid() || m.Host == "" {
+		return false
+	}
+	switch c.kind {
+	case kindIPCIDR, kindGeoIPPrivate, kindGeoIPCN:
+		return true
+	}
+	return false
+}
+
 // dstUsable reports whether an IP rule may look at m.Dst.
 //
 // A rule marked no-resolve exists to say "decide on the address the client sent,
-// do not resolve the name for me". The engine resolves a name exactly once, for
-// the rules that do want an address (see engine.route), and flags the result in
-// Meta.DstFromLookup; without this check that single lookup would silently feed
-// every no-resolve rule in the table and undo the user's choice.
+// do not resolve the name for me". The matcher resolves a name at most once, for
+// the rules that do want an address (see MatchWithResolver), and flags the
+// result in Meta.DstFromLookup; without this check that single lookup would
+// silently feed every no-resolve rule in the table and undo the user's choice.
 func (c compiled) dstUsable(m Meta) bool {
 	if !m.Dst.IsValid() {
 		return false

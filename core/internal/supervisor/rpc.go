@@ -377,8 +377,13 @@ func (s *Supervisor) Import(p rpc.ImportParams) (rpc.ImportResult, error) {
 	// to the generated groups, while a group a document curates replaces the
 	// stored one of the same tag. The counts are what the documents contributed,
 	// not the size of the resulting table.
+	//
+	// A pasted profile states a complete rule table, so it still owns it: its
+	// rules replace every stored rule, and they carry source so a later
+	// subscription refresh knows they are not its to replace.
+	origin := routingOrigin{Source: source, OwnsTable: true}
 	for _, t := range tables {
-		groups, rules, warnings := s.mergeRouting(t)
+		groups, rules, warnings := s.mergeRouting(t, origin)
 		res.Groups += groups
 		res.Rules += rules
 		for _, w := range warnings {
@@ -628,8 +633,10 @@ func (s *Supervisor) addSubscription(p rpc.SubParams) (any, error) {
 	return s.Groups(), nil
 }
 
-// updateSubscription re-fetches a subscription and replaces its nodes, and the
-// groups and rules that a Clash document among them carries.
+// updateSubscription re-fetches a subscription and replaces what it contributed
+// last time — its nodes, and the groups and rules that a Clash document among
+// them carries. Rows from other sources, and rows the user wrote (no source),
+// survive the refresh.
 func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]state.NodeStatus, error) {
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
@@ -688,10 +695,18 @@ func (s *Supervisor) updateSubscription(ctx context.Context, name string) ([]sta
 		cfg.Groups[gi].Members = members
 	}
 	pruneRouting(&cfg)
-	groups, rules, warnings := mergeRoutingTable(&cfg, fetched.Routing)
+	// The refresh speaks only for this subscription: mergeRoutingTable drops the
+	// groups and rules stamped with its name and merges the new ones, so a
+	// document that stopped defining a group or rule takes it along, while the
+	// user's own rows and every other source's stay.
+	groups, rules, warnings := mergeRoutingTable(&cfg, fetched.Routing, routingOrigin{Source: name})
 	for _, w := range warnings {
 		s.log.Warnf("subscription %s: %s", name, w)
 	}
+	// Dropping one of the subscription's groups can leave another rule (one the
+	// user wrote) addressing a tag that no longer exists; validation would refuse
+	// the whole refresh, so the references go with the group.
+	pruneRouting(&cfg)
 	if err := s.persist(cfg); err != nil {
 		return nil, err
 	}
@@ -744,6 +759,23 @@ func (s *Supervisor) deleteSubscription(name string) error {
 		}
 	}
 	cfg.Nodes = nodes
+	// The groups and rules the subscription brought go with it. Rows without its
+	// name were written by the user or came from another document and are not
+	// this delete's to remove.
+	groups := make([]config.Group, 0, len(cfg.Groups))
+	for _, g := range cfg.Groups {
+		if g.Source != name {
+			groups = append(groups, g)
+		}
+	}
+	cfg.Groups = groups
+	rules := make([]config.Rule, 0, len(cfg.Rules))
+	for _, r := range cfg.Rules {
+		if r.Source != name {
+			rules = append(rules, r)
+		}
+	}
+	cfg.Rules = rules
 	pruneRouting(&cfg)
 	if err := s.persist(cfg); err != nil {
 		return err

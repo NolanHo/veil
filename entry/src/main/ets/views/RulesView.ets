@@ -7,6 +7,12 @@ import { Chip } from './Ui';
 import { errorText, toast } from './Common';
 
 /**
+ * Import warnings are capped: the sheet is a result preview, not a log viewer,
+ * and a long profile can produce one note per dropped rule.
+ */
+const MAX_WARN_SHOWN: number = 5;
+
+/**
  * 规则 — routing mode, the ordered rule table, subscription maintenance and the
  * import sheet.
  *
@@ -30,6 +36,7 @@ export struct RulesView {
   @State subName: string = '';
   @State subUrl: string = '';
   @State resultLine: string = '';
+  @State resultWarnings: string[] = [];
   @State resultErrors: string[] = [];
 
   aboutToAppear(): void {
@@ -84,6 +91,35 @@ export struct RulesView {
     return this.dark ? '#5EEAD4' : '#0E9F8E';
   }
 
+  /**
+   * The import's non-fatal notes, capped. They explain a result the counts
+   * alone hide ("失败 0" next to a table the import just cleared), so they are
+   * shown even though the import succeeded.
+   */
+  private shownWarnings(): string[] {
+    return this.resultWarnings.length > MAX_WARN_SHOWN ?
+      this.resultWarnings.slice(0, MAX_WARN_SHOWN) : this.resultWarnings;
+  }
+
+  /** How many notes the cap hides, so the sheet can say so in one line. */
+  private hiddenWarnings(): number {
+    return this.resultWarnings.length - this.shownWarnings().length;
+  }
+
+  /**
+   * PROCESS-NAME rules compile but can never fire: the tun hands over packets
+   * without the owning application, so the engine has no process identity to
+   * match. Flagged in the table instead of letting the rule look effective.
+   */
+  private hasProcessRules(): boolean {
+    for (let i = 0; i < this.rules.length; i++) {
+      if (this.rules[i].type === 'process') {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private async updateSub(name: string): Promise<void> {
     if (this.busyName.length > 0) {
       return;
@@ -125,10 +161,12 @@ export struct RulesView {
         ' · 失败 ' + r.failed.toString() + ' · 分组 ' + groups.toString() +
         ' · 规则 ' + rules.toString();
       this.resultErrors = r.errors === undefined ? [] : r.errors;
+      this.resultWarnings = r.warnings === undefined || r.warnings === null ? [] : r.warnings;
       this.pasteText = '';
       await this.load();
     } catch (err) {
       this.resultLine = '';
+      this.resultWarnings = [];
       this.resultErrors = [errorText(err)];
     }
   }
@@ -146,8 +184,11 @@ export struct RulesView {
       this.subName = '';
       this.subUrl = '';
       this.resultLine = '订阅已添加: ' + name;
+      // Notes belong to the import they came from; this result line is not one.
+      this.resultWarnings = [];
       await this.load();
     } catch (err) {
+      this.resultWarnings = [];
       this.resultErrors = [errorText(err)];
     }
   }
@@ -195,6 +236,31 @@ export struct RulesView {
           .fontColor($r('app.color.veil_teal'))
           .width('100%')
           .textAlign(TextAlign.Start)
+      }
+
+      // Non-fatal import notes: quieter than an error, but the only place the
+      // user learns *what* was dropped when the counts say "失败 0".
+      if (this.shownWarnings().length > 0) {
+        Column({ space: 3 }) {
+          ForEach(this.shownWarnings(), (w: string) => {
+            Text(w)
+              .fontSize(10)
+              .fontColor($r('app.color.veil_text_faint'))
+              .width('100%')
+              .textAlign(TextAlign.Start)
+              .maxLines(3)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }, (w: string, idx: number) => idx.toString() + w)
+
+          if (this.hiddenWarnings() > 0) {
+            Text('还有 ' + this.hiddenWarnings().toString() + ' 条')
+              .fontSize(10)
+              .fontColor($r('app.color.veil_text_faint'))
+              .width('100%')
+              .textAlign(TextAlign.Start)
+          }
+        }
+        .width('100%')
       }
 
       if (this.resultErrors.length > 0) {
@@ -282,6 +348,11 @@ export struct RulesView {
             // A flag, not a routing decision: keep it quiet and out of the
             // action colour so it reads as an annotation on the value.
             Tag({ label: 'no-resolve', tone: this.dark ? '#8B94A5' : '#5B6474' })
+          }
+          if (rule.type === 'process') {
+            // The rule is kept (it is the user's config) but cannot fire; the
+            // marker says so at the row, the card footnote explains why.
+            Tag({ label: '未生效', tone: this.dark ? '#8B94A5' : '#5B6474' })
           }
         }
         .width('100%')
@@ -413,6 +484,16 @@ export struct RulesView {
                   this.ruleRow(rule, index)
                   Hairline()
                 }, (rule: Rule, index: number) => index.toString() + rule.type + rule.value)
+
+                // One explanation for all flagged rows, not a hint per row.
+                if (this.hasProcessRules()) {
+                  Text('PROCESS-NAME 需要系统提供进程身份，当前版本不会命中。')
+                    .fontSize(11)
+                    .fontColor($r('app.color.veil_text_faint'))
+                    .width('100%')
+                    .textAlign(TextAlign.Start)
+                    .padding({ top: 10 })
+                }
               }
             }
             .width('100%')

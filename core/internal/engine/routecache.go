@@ -20,6 +20,10 @@ import (
 // same few names, and a DNS round trip per connection would turn a routing
 // decision into visible latency.
 //
+// Only a lookup a rule actually asked for lands here: matching is lazy (see
+// rules.MatchWithResolver), so a name a domain rule classified never reaches
+// this table at all.
+//
 // The resolver has a cache of its own, but it is gated on the user's
 // `dns.cache` setting; rule evaluation must not become slow just because that
 // knob is off, so the engine keeps its own short-lived table.
@@ -138,7 +142,9 @@ func (c *routeAddrCache) finish(host string, f *routeFlight, ent routeAddrEntry,
 
 // lookupForRoute resolves host for rule matching. The resolver is passed in
 // because a reload can swap it; callers must not hold e.mu here, the resolver
-// does its own I/O.
+// does its own I/O. The only caller is the callback route hands to the matcher,
+// which invokes it at most once per decision and only when a rule needs an
+// address.
 func (e *Engine) lookupForRoute(ctx context.Context, resolver *dns.Resolver, host string) ([]netip.Addr, error) {
 	now := time.Now()
 	if ent, ok := e.routeCache.get(host, now); ok {

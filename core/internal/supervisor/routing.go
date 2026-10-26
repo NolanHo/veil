@@ -59,89 +59,230 @@ func clashRouting(c share.ClashConfig, errs []error) routingTable {
 	return t
 }
 
+// routingOrigin says where one document's routing rows come from and how much of
+// the stored table they own.
+type routingOrigin struct {
+	// Source is the label stamped on every group and rule the document brings:
+	// the subscription's name when one is refreshed, or the source a pasted
+	// profile is imported under (the same label its nodes get). A later refresh
+	// finds its own rows by this label; a row without one belongs to the user.
+	Source string
+
+	// OwnsTable makes the document's rule list replace the whole table instead of
+	// only the rows that carry Source. A pasted Clash profile states a complete,
+	// ordered rule table, so it owns the table; a subscription only owns its own
+	// slice of it.
+	OwnsTable bool
+}
+
 // mergeRouting folds one document's routing table into the live configuration.
-func (s *Supervisor) mergeRouting(t routingTable) (groupCount, ruleCount int, warnings []string) {
+func (s *Supervisor) mergeRouting(t routingTable, origin routingOrigin) (groupCount, ruleCount int, warnings []string) {
 	if !t.GroupsProvided && !t.RulesProvided {
 		return 0, 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return mergeRoutingTable(&s.cfg, t)
+	return mergeRoutingTable(&s.cfg, t, origin)
 }
 
 // mergeRoutingTable folds t into cfg and reports how many groups and rules the
 // document contributed.
 //
-// A group or rule the document defines replaces the one already there, and
-// everything else is kept: the routing table of a pasted profile is the user's
-// intent for the tags it names, not necessarily the whole of what they have
-// stored (a second subscription, groups they built in the UI). A *stated but
-// empty* section is different — it says the profile has no groups/rules at all,
-// and the corresponding table is cleared.
+// A row the document defines replaces the one already there, and everything else
+// is kept: the routing table of a document is its intent for the tags it names,
+// not necessarily the whole of what the user has stored (a second subscription,
+// groups they built in the UI). What "everything else" is, though, depends on
+// who the document speaks for (routingOrigin): a pasted profile states a
+// complete rule table, so OwnsTable clears what was there, while a subscription
+// only replaces the rows stamped with its own name and leaves the user's rules
+// and every other source alone. A *stated but empty* section says the document
+// has no groups/rules at all, and clears that same scope, never more.
 //
 // Groups are re-ordered across the whole merged set, not just across the
 // document's own groups: the engine builds groups in one pass and drops a group
 // whose member does not exist yet, so a merged set can be broken by an order
 // that was valid in each half separately.
-func mergeRoutingTable(cfg *config.Config, t routingTable) (groupCount, ruleCount int, warnings []string) {
+func mergeRoutingTable(cfg *config.Config, t routingTable, origin routingOrigin) (groupCount, ruleCount int, warnings []string) {
 	if t.GroupsProvided {
 		if len(t.Groups) > 0 {
-			incoming := make(map[string]bool, len(t.Groups))
+			incoming := make([]config.Group, 0, len(t.Groups))
+			defined := make(map[string]bool, len(t.Groups))
 			for _, g := range t.Groups {
-				incoming[g.Tag] = true
+				g.Source = origin.Source
+				incoming = append(incoming, g)
+				defined[g.Tag] = true
 			}
-			kept := make([]config.Group, 0, len(cfg.Groups)+len(t.Groups))
+			kept := make([]config.Group, 0, len(cfg.Groups)+len(incoming))
 			for _, g := range cfg.Groups {
-				if !incoming[g.Tag] {
-					kept = append(kept, g)
+				// A refresh drops the groups this source brought last time: a group
+				// the document no longer defines is gone from the document.
+				if !origin.OwnsTable && fromSource(g.Source, origin.Source) {
+					continue
 				}
+				if defined[g.Tag] {
+					if g.Source != origin.Source {
+						// A tag is an outbound's identity, so only one group can hold
+						// it, and the document's rules already name its version. The
+						// group that loses is the user's own, so say it.
+						from := g.Source
+						if from == "" {
+							from = "a hand-built group"
+						}
+						warnings = append(warnings, fmt.Sprintf(
+							"group %q replaces the group of the same name from %s", g.Tag, from))
+					}
+					continue
+				}
+				kept = append(kept, g)
 			}
 			var orderWarnings []string
-			cfg.Groups, orderWarnings = orderGroups(append(kept, t.Groups...))
+			cfg.Groups, orderWarnings = orderGroups(append(kept, incoming...))
 			warnings = append(warnings, orderWarnings...)
-			groupCount = len(t.Groups)
-		} else {
+			groupCount = len(incoming)
+		} else if origin.OwnsTable {
 			// `proxy-groups: []`: the profile states that it defines no groups.
 			// The generated selector stays, so the imported nodes remain
 			// reachable and a later node import still has somewhere to put them.
 			cfg.Groups = autoGroups(cfg.Groups)
 			warnings = append(warnings, "the document states an empty proxy-groups list; only generated groups were kept")
+		} else {
+			// A subscription that stops stating groups stops contributing them;
+			// the groups other sources and the user built are not its to clear.
+			kept := make([]config.Group, 0, len(cfg.Groups))
+			for _, g := range cfg.Groups {
+				if !fromSource(g.Source, origin.Source) {
+					kept = append(kept, g)
+				}
+			}
+			cfg.Groups = kept
+			warnings = append(warnings, "the document states an empty proxy-groups list; the subscription's groups were removed")
 		}
 	}
 	if t.RulesProvided {
-		if len(t.Rules) > 0 {
-			// A Clash profile's rule list is an ordered, complete table and first
-			// match wins. Merging imported rules *behind* the stock ones silently
-			// shadows them — the stock "geoip private → direct" beats an imported
-			// "ip-cidr 10.x → wireguard", which is exactly what a split tunnel
-			// needs to work. So the import replaces the table; the stock rules are
-			// starter content, not user intent.
-			rules := append([]config.Rule(nil), t.Rules...)
-			if !hasFinalRule(rules) {
-				// Without a final rule unmatched traffic has no destination at all.
-				rules = append(rules, config.Rule{Type: "final"})
+		if origin.OwnsTable {
+			if len(t.Rules) > 0 {
+				// A Clash profile's rule list is an ordered, complete table and first
+				// match wins. Merging imported rules *behind* the stock ones silently
+				// shadows them — the stock "geoip private → direct" beats an imported
+				// "ip-cidr 10.x → wireguard", which is exactly what a split tunnel
+				// needs to work. So the import replaces the table; the stock rules are
+				// starter content, not user intent.
+				rules := make([]config.Rule, 0, len(t.Rules)+1)
+				for _, r := range t.Rules {
+					r.Source = origin.Source
+					rules = append(rules, r)
+				}
+				if !hasFinalRule(rules) {
+					// Without a final rule unmatched traffic has no destination at all.
+					// The appended one carries no source: it is this app's fallback, not
+					// something the document said.
+					rules = append(rules, config.Rule{Type: "final"})
+				}
+				cfg.Rules = rules
+				ruleCount = len(t.Rules)
+			} else {
+				// `rules: []`: the profile states that no rule should match, so
+				// traffic follows the engine's default outbound. Nothing is appended
+				// here — a final rule would contradict the empty list.
+				cfg.Rules = []config.Rule{}
+				warnings = append(warnings, "the document states an empty rules list; the rule table is now empty")
 			}
-			cfg.Rules = rules
-			ruleCount = len(t.Rules)
 		} else {
-			// `rules: []`: the profile states that no rule should match, so
-			// traffic follows the engine's default outbound. Nothing is appended
-			// here — a final rule would contradict the empty list.
-			cfg.Rules = []config.Rule{}
-			warnings = append(warnings, "the document states an empty rules list; the rule table is now empty")
+			var ruleWarnings []string
+			ruleCount, ruleWarnings = mergeSourceRules(cfg, origin.Source, t)
+			warnings = append(warnings, ruleWarnings...)
 		}
 	}
 	return groupCount, ruleCount, warnings
 }
 
-func hasFinalRule(rules []config.Rule) bool {
-	for _, r := range rules {
+// mergeSourceRules replaces one source's slice of the rule table and leaves every
+// other row exactly where it is.
+//
+// Rule order is the semantics ("first match wins"), so both placements are
+// load-bearing:
+//
+//   - The document's rules take the span its old rules occupied, so a refresh
+//     never moves a subscription's block across the rules the user wrote. A
+//     source that has no rules yet is inserted just above the table's catch-all:
+//     below it, none of them could ever match.
+//   - A final rule is a catch-all and therefore cannot be inserted between stored
+//     rules either. It takes the stored final's place when that one carries no
+//     action (the app writes such a placeholder when nobody picked a target), and
+//     otherwise the stored final wins with a warning, because swapping it would
+//     silently change where the user's unmatched traffic goes.
+func mergeSourceRules(cfg *config.Config, source string, t routingTable) (ruleCount int, warnings []string) {
+	body := make([]config.Rule, 0, len(t.Rules))
+	var docFinal *config.Rule
+	for _, r := range t.Rules {
+		r.Source = source
 		if r.Type == "final" {
-			return true
+			if docFinal == nil {
+				final := r
+				docFinal = &final
+			}
+			continue
+		}
+		body = append(body, r)
+	}
+
+	kept := make([]config.Rule, 0, len(cfg.Rules))
+	at := -1
+	for _, r := range cfg.Rules {
+		if fromSource(r.Source, source) {
+			if at < 0 {
+				at = len(kept)
+			}
+			continue
+		}
+		kept = append(kept, r)
+	}
+	if at < 0 {
+		at = finalIndex(kept)
+	}
+	out := make([]config.Rule, 0, len(kept)+len(body)+1)
+	out = append(out, kept[:at]...)
+	out = append(out, body...)
+	out = append(out, kept[at:]...)
+	ruleCount = len(body)
+
+	if docFinal != nil {
+		if i := finalIndex(out); i < len(out) {
+			if out[i].Action == "" {
+				out[i] = *docFinal
+				ruleCount++
+			} else {
+				warnings = append(warnings, fmt.Sprintf(
+					"the document's MATCH rule was skipped: the rule table already falls through to %q", out[i].Action))
+			}
+		} else {
+			out = append(out, *docFinal)
+			ruleCount++
 		}
 	}
-	return false
+	if len(t.Rules) == 0 {
+		warnings = append(warnings, "the document states an empty rules list; the subscription's rules were removed")
+	}
+	cfg.Rules = out
+	return ruleCount, warnings
 }
+
+// fromSource reports whether a stored row belongs to source. Nothing belongs to
+// the empty source: those rows were written by hand.
+func fromSource(row, source string) bool { return source != "" && row == source }
+
+// finalIndex is the position of the first catch-all rule, or len(rules) when the
+// table has none.
+func finalIndex(rules []config.Rule) int {
+	for i, r := range rules {
+		if r.Type == "final" {
+			return i
+		}
+	}
+	return len(rules)
+}
+
+func hasFinalRule(rules []config.Rule) bool { return finalIndex(rules) < len(rules) }
 
 // autoGroups keeps the generated groups only.
 func autoGroups(groups []config.Group) []config.Group {

@@ -77,21 +77,36 @@ socks5/http (mixed)  ──┼─▶ engine.HandleTCP ─▶ route ─▶ group 
                        └─▶ engine.HandleUDP ─▶ route ─▶ udp association cache
 ```
 
-Routing resolves a domain when the rule set contains an IP rule
-(`GEOIP`, `IP-CIDR`, `IP-CIDR6`) that is allowed to use the answer. The lookup
-goes through the engine's own resolver — the configured DoH/DoT upstreams, on the
-same detour-aware path the tunnel DNS uses, never the OS resolver — with a 3 s
-budget and a one-minute cache in the engine, so a page load with dozens of
-connections costs one query. The outbound still receives the hostname, so the
-exit node performs the authoritative lookup; the local one only classifies
-traffic.
+Routing is lazy about addresses: the matcher walks the rule table in order and
+asks for a name's address only when it actually reaches an IP rule (`GEOIP`,
+`IP-CIDR`, `IP-CIDR6`) that has none to look at. This is the Clash/mihomo
+behaviour, and it matters: resolving up front as soon as the table happened to
+contain an IP rule charged every new name a DNS round trip even when a domain
+rule matched first — which, under fake-IP, was almost every connection. A
+`DOMAIN-SUFFIX,corp.example,DIRECT` above `GEOIP,CN,DIRECT` now classifies
+corporate hosts without any query at all.
 
-This includes flows that arrive on a fake-IP address. A fake address
-(198.18.0.0/15) carries nothing but the requested name, so with fake-IP enabled
-*every* connection needs that lookup before an IP rule can match — without it
-`GEOIP,CN,DIRECT` never fires and domestic traffic falls through to `MATCH`.
-A failed lookup is not fatal: rules that need an address simply do not match, a
-debug line records why, and evaluation continues.
+The lookup goes through the engine's own resolver — the configured DoH/DoT
+upstreams, on the same detour-aware path the tunnel DNS uses, never the OS
+resolver — with a 3 s budget, a one-minute cache and single-flight collapsing in
+the engine, so a page load with dozens of connections to one name costs one
+query. It runs at most once per routing decision, and the address it returns
+feeds the rest of the walk. The outbound still receives the hostname, so the exit
+node performs the authoritative lookup; the local one only classifies traffic.
+
+This is what makes IP rules work for flows that arrive on a fake-IP address. A
+fake address (198.18.0.0/15) carries nothing but the requested name, so an IP
+rule has no address until the router fetches one — without that fetch
+`GEOIP,CN,DIRECT` never fires and domestic traffic falls through to `MATCH`. A
+failed lookup is not fatal: the rule that wanted the address simply does not
+match, a debug line records why, and evaluation continues with the next rule.
+
+A decision that dials on this device is the one flow that cannot skip the
+lookup: a local dial has no exit node to resolve for it, and handing it the
+fake address (or a name that only exists inside our DNS) connects to nothing.
+So when the walk produced no address and the chosen outbound dials locally, the
+router resolves once more, at the dial — the same lookup, from the same cache,
+bounded the same way.
 
 `no-resolve` is honoured in both directions. Such a rule never makes the router
 resolve, and it never matches an address the router looked up — it only sees a

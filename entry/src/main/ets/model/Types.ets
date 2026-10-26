@@ -167,6 +167,10 @@ export interface Rule {
   value: string;
   action: string;
   no_resolve?: boolean;
+  // Which subscription (or paste) brought this rule in. Empty means the user
+  // wrote it by hand, and a subscription refresh will never touch it — so the
+  // field has to survive a config round-trip through the UI.
+  source?: string;
 }
 
 export interface DNSServer {

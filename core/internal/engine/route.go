@@ -17,12 +17,11 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 	if err != nil {
 		return nil, rules.Action{}, target, err
 	}
-	// The matcher, the resolver and the "does any IP rule exist" flag are
-	// replaced by SetMode and Reload. Snapshot them under the lock: the matcher
-	// object is immutable, but the pointers are not safe to read concurrently
-	// with a write.
+	// The matcher and the resolver are replaced by SetMode and Reload. Snapshot
+	// them under the lock: the matcher object is immutable, but the pointers are
+	// not safe to read concurrently with a write.
 	e.mu.RLock()
-	router, needsIP, resolver := e.router, e.needsIP, e.resolver
+	router, resolver := e.router, e.resolver
 	e.mu.RUnlock()
 
 	// A fake address stands for a domain. Recover the name so domain rules can
@@ -43,27 +42,44 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 	// one: it only carries the name the client asked for. Leaving it unresolved
 	// made every IP rule dead for fake-IP flows, so domestic sites that a Clash
 	// config routes with `GEOIP,CN,DIRECT` fell through to MATCH and went out
-	// through the proxy. Resolve the name, hand the address to the matcher, and
-	// keep the hostname in `target` — the exit node still performs the
-	// authoritative lookup, this one only classifies the connection.
+	// through the proxy. The matcher gets a lookup callback and performs it when
+	// its walk reaches such a rule — not before — and `target` keeps the
+	// hostname: the exit node still performs the authoritative lookup, this one
+	// only classifies the connection.
 	//
-	// Rules marked `no-resolve` are deliberately excluded from "needsIP" and do
-	// not accept this address (see rules.Meta.DstFromLookup); resolving for them
-	// would be the very leak the flag asks us to avoid.
-	if needsIP && host != "" && resolver != nil {
-		addrs, err := e.lookupForRoute(ctx, resolver, host)
-		if err != nil {
-			// No address is a normal outcome: NXDOMAIN, a blocked upstream, or a
-			// fake-IP name that does not exist on the wire. IP rules then see an
-			// unresolved target and the remaining rules still get their chance.
-			e.log.Debugf("resolve %s for routing failed: %v", host, err)
-		} else if len(addrs) > 0 {
-			meta.Dst = addrs[0]
-			meta.DstFromLookup = true
+	// Lazy on purpose, the way Clash and mihomo behave. Resolving up front as
+	// soon as the table contained any IP rule cost every new name a DNS round
+	// trip even when a domain rule matched first, and under fake-IP that was the
+	// common case.
+	//
+	// Rules marked `no-resolve` never ask for the lookup and do not accept its
+	// answer (see rules.Meta.DstFromLookup); resolving for them would be the
+	// very leak the flag asks us to avoid.
+	var lookedUp netip.Addr
+	var resolve rules.Resolver
+	if host != "" && resolver != nil {
+		resolve = func() (netip.Addr, error) {
+			// One lookup per decision even if the matcher ever asked twice.
+			if lookedUp.IsValid() {
+				return lookedUp, nil
+			}
+			addrs, err := e.lookupForRoute(ctx, resolver, host)
+			if err != nil {
+				// No address is a normal outcome: NXDOMAIN, a blocked upstream, or a
+				// fake-IP name that does not exist on the wire. IP rules then see an
+				// unresolved target and the remaining rules still get their chance.
+				e.log.Debugf("resolve %s for routing failed: %v", host, err)
+				return netip.Addr{}, err
+			}
+			if len(addrs) == 0 {
+				return netip.Addr{}, nil
+			}
+			lookedUp = addrs[0]
+			return lookedUp, nil
 		}
 	}
 
-	action := router.Match(meta)
+	action := router.MatchWithResolver(meta, resolve)
 	if action.Reject {
 		return nil, action, target, outbound.ErrRejected
 	}
@@ -89,8 +105,18 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 	if ld, ok := ob.(outbound.LocalDialer); ok {
 		dialsLocally = ld.DialsLocally()
 	}
-	if fromFake && meta.Dst.IsValid() && dialsLocally {
-		target = netip.AddrPortFrom(meta.Dst.Unmap(), port).String()
+	if fromFake && dialsLocally {
+		// The walk may not have needed an address: a domain rule can decide the
+		// connection before the table reaches an IP rule, and MODE DIRECT ignores
+		// the table altogether. A local dial has no such choice — it cannot dial
+		// a name that only exists inside our DNS — so the lookup happens here,
+		// once, and only for flows that actually go out directly.
+		if !lookedUp.IsValid() && resolve != nil {
+			_, _ = resolve()
+		}
+		if lookedUp.IsValid() {
+			target = netip.AddrPortFrom(lookedUp.Unmap(), port).String()
+		}
 	}
 	return ob, action, target, nil
 }

@@ -58,6 +58,29 @@ scripts/build-core.sh          # produces entry/src/main/libs/arm64-v8a/libveil.
 - **Observation**: live connections with per-connection byte counters, latency
   probes, real traffic rates, log ring buffer.
 
+## Setting it up on a device
+
+Paste the profile you already run elsewhere — Clash Verge, mihomo, whatever
+writes a Clash document — into **规则 → 导入**. Proxies, `proxy-groups` and
+`rules` all come across, so a profile that sends `10.20.1.0/24` to a WireGuard
+peer and everything else through a Hysteria2 node works without retyping the
+routing. WireGuard peers can also be pasted as a `wg-quick` `.conf`.
+
+Two behaviours worth knowing:
+
+- an imported rule table replaces the stock one (first match wins; appending
+  behind the stock `geoip private → direct` would shadow a split tunnel into a
+  private range). A document that says `rules: []` clears it, one that says
+  nothing about rules leaves it alone.
+- with fake-ip DNS on, a domain reaches the router as a fake address. IP rules
+  still need a real one, so the router resolves the name through the
+  configured upstream at route time and dials the hostname afterwards — the
+  exit node remains the authority. A direct connection, which resolves locally,
+  dials the resolved address instead of the fake one.
+
+`GEOIP,CN` uses an APNIC-derived allocation table, so "domestic direct,
+everything else through the node" behaves the way a Clash profile expects.
+
 ## Why it won't rot
 
 The failures of the original client were lifecycle bugs, not protocol bugs.
