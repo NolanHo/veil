@@ -98,7 +98,7 @@ proxy-groups:
     type: fallback
     use:
       - PROXY
-    url: "http://provider.invalid/sub"
+    url: "https://probe.example/generate_204"
     interval: 300
     tolerance: 50
     filter: "^((?!Traffic).)*$"
@@ -106,7 +106,7 @@ proxy-groups:
     type: fallback
     use:
       - PROXY
-    url: "http://provider.invalid/sub"
+    url: "https://probe.example/generate_204"
     interval: 300
     tolerance: 50
     filter: "(?i)Hong Kong|香港|港"
@@ -114,7 +114,7 @@ proxy-groups:
     type: fallback
     use:
       - PROXY
-    url: "http://provider.invalid/sub"
+    url: "https://probe.example/generate_204"
     interval: 300
     tolerance: 50
     filter: "(?i)日|jp|japan"
@@ -122,7 +122,7 @@ proxy-groups:
     type: fallback
     use:
       - PROXY
-    url: "http://provider.invalid/sub"
+    url: "https://probe.example/generate_204"
     interval: 300
     tolerance: 50
     filter: "(?i)United States|美国|美"
@@ -148,7 +148,7 @@ rule-providers:
     type: http
     behavior: classical
     format: yaml
-    url: "http://provider.invalid/sub"
+    url: "https://probe.example/generate_204"
     path: ./ruleset/applications.yaml
     interval: 604800
     proxy: mdev-hk
