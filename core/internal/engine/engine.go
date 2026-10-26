@@ -112,18 +112,24 @@ func (e *Engine) Start(ctx context.Context, tunFD int) error {
 
 	// 1. Outbounds. A broken node must not take the whole engine down: record it
 	// and keep going, the supervisor reports the engine as degraded.
+	// factory.Build knows the whole configuration, which is what a chained
+	// outbound needs: it has to dial through another node (or the member a group
+	// currently selects), and that only exists once every node is built.
+	built, buildErrs := factory.Build(e.cfg, e.resolveTag)
 	var failed []string
-	for _, n := range e.cfg.Nodes {
-		ob, err := e.buildOutbound(n)
-		if err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v", n.Tag, err))
-			e.log.Errorf("outbound %s (%s) failed to initialise: %v", n.Tag, n.Type, err)
-			continue
-		}
-		e.outbounds[n.Tag] = ob
+	for _, err := range buildErrs {
+		failed = append(failed, err.Error())
+		e.log.Errorf("outbound failed to initialise: %v", err)
 	}
-	e.outbounds["direct"] = factory.Direct{}
-	e.outbounds["reject"] = factory.Reject{}
+	for tag, ob := range built {
+		e.outbounds[tag] = ob
+	}
+	if _, ok := e.outbounds["direct"]; !ok {
+		e.outbounds["direct"] = factory.Direct{}
+	}
+	if _, ok := e.outbounds["reject"]; !ok {
+		e.outbounds["reject"] = factory.Reject{}
+	}
 	if len(failed) == len(e.cfg.Nodes) && len(e.cfg.Nodes) > 0 {
 		e.setLastErr(strings.Join(failed, "; "))
 	}

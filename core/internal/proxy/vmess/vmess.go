@@ -48,7 +48,13 @@ var (
 )
 
 // New builds a VMess client for n.
-func New(n config.Node) (*Client, error) {
+func New(n config.Node) (*Client, error) { return NewVia(n, nil) }
+
+// NewVia is New with the TCP connection to the server opened by base instead of
+// a direct dial: the transport stack is carried by that connection, which is how
+// a chained outbound (mihomo's `dialer-proxy`) reaches its server through
+// another proxy. A nil base dials directly, exactly like New.
+func NewVia(n config.Node, base transport.Dialer) (*Client, error) {
 	if n.UUID == "" {
 		return nil, fmt.Errorf("vmess %q: missing uuid", n.Tag)
 	}
@@ -68,7 +74,7 @@ func New(n config.Node) (*Client, error) {
 		return nil, fmt.Errorf("vmess %q: %w", n.Tag, err)
 	}
 
-	dialer, err := transport.Build(n)
+	dialer, err := transport.BuildWith(n, base)
 	if err != nil {
 		return nil, fmt.Errorf("vmess %q: build transport: %w", n.Tag, err)
 	}

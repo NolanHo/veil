@@ -95,6 +95,10 @@ func ParseClashConfig(doc []byte, source string) (ClashConfig, []error) {
 	}
 	groups := parseClashGroups(groupEntries, ns, &errs)
 
+	// dialer-proxy names an outbound, and groups join the namespace only above;
+	// see resolveDialerProxies (clash.go).
+	nodes = resolveDialerProxies(nodes, ns, &errs)
+
 	ruleEntries, rulesProvided, err := clashSection(&d.Rules)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("share: clash rules: %w", err))

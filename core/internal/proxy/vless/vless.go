@@ -37,7 +37,13 @@ type Client struct {
 }
 
 // New builds a VLESS client from a configuration node.
-func New(n config.Node) (*Client, error) {
+func New(n config.Node) (*Client, error) { return NewVia(n, nil) }
+
+// NewVia is New with the TCP connection to the server opened by base instead of
+// a direct dial: the transport stack is carried by that connection, which is how
+// a chained outbound (mihomo's `dialer-proxy`) reaches its server through
+// another proxy. A nil base dials directly, exactly like New.
+func NewVia(n config.Node, base transport.Dialer) (*Client, error) {
 	if t := strings.TrimSpace(n.Type); t != "" && !strings.EqualFold(t, "vless") {
 		return nil, fmt.Errorf("vless: node %q has type %q", n.Tag, n.Type)
 	}
@@ -49,7 +55,7 @@ func New(n config.Node) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	dialer, err := transport.Build(n)
+	dialer, err := transport.BuildWith(n, base)
 	if err != nil {
 		return nil, fmt.Errorf("vless: node %q: %w", n.Tag, err)
 	}

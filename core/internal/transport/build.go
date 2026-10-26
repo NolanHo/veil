@@ -13,8 +13,26 @@ import (
 //
 // A tls block carrying a REALITY public key means REALITY, whatever the
 // "fingerprint"/"alpn" fields say; everything else is a normal uTLS handshake.
+//
+// The TCP connection to the node's server is a direct, protect-aware dial; see
+// BuildWith for the same stack over a connection somebody else opens.
 func Build(n config.Node) (Dialer, error) {
-	base := TCP(n.Addr())
+	return BuildWith(n, nil)
+}
+
+// BuildWith is Build over a caller-supplied base dialer: the connection to the
+// node's own endpoint is opened by base, and everything this function layers
+// (TLS/REALITY, WebSocket, gRPC) rides on that connection. The peer therefore
+// sees the handshake arriving from base's exit, not from this device — which is
+// what a chained outbound (mihomo's `dialer-proxy`) means.
+//
+// base is expected to dial the node's address (the factory binds it to n.Addr()
+// so a Dialer, which carries no address of its own, is enough). A nil base is
+// the direct TCP dial, exactly like Build.
+func BuildWith(n config.Node, base Dialer) (Dialer, error) {
+	if base == nil {
+		base = TCP(n.Addr())
+	}
 
 	tlsCfg := n.TLS
 	tr := n.Transport

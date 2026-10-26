@@ -221,7 +221,7 @@ proxies:
     port: 443
     password: placeholder
   - name: "old-socks"
-    type: socks5
+    type: tuic
     server: 198.51.100.7
     port: 1080
 proxy-groups:
@@ -247,7 +247,7 @@ rules:
 	for _, e := range errs {
 		joined += e.Error() + "\n"
 	}
-	for _, want := range []string{"old-socks", "socks5"} {
+	for _, want := range []string{"old-socks", "tuic"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("errs = %v, want %q named", errs, want)
 		}

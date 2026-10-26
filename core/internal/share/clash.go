@@ -35,6 +35,7 @@ type clashProxy struct {
 	Server            string `yaml:"server"`
 	Port              any    `yaml:"port"`
 	UUID              string `yaml:"uuid"`
+	Username          string `yaml:"username"`
 	Password          string `yaml:"password"`
 	Cipher            string `yaml:"cipher"`
 	AlterID           any    `yaml:"alterId"`
@@ -162,9 +163,8 @@ func asInt(v any) int {
 //
 // Entries we cannot drive are never fatal: `direct`/`reject` style pseudo
 // proxies are skipped silently, and a real proxy this build does not support
-// (socks5, tuic, a chained dialer-proxy, ...) is skipped with an error so the
-// user learns why one node of their subscription is missing while the rest
-// still import.
+// (socks5, tuic, ...) is skipped with an error so the user learns why one node
+// of their subscription is missing while the rest still import.
 //
 // This is the nodes-only door, kept for callers that cannot consume groups and
 // rules (subscription fetch). The returned errors describe the whole document,
@@ -241,21 +241,19 @@ func (p *clashProxy) node() (config.Node, error) {
 	server := strings.TrimSpace(p.Server)
 	port := asInt(p.Port)
 
-	// A chained dialer-proxy means "reach this peer through another outbound",
-	// which this build does not implement; importing the node anyway would make
-	// it dial directly and fail in a way nobody can explain.
-	if d := strings.TrimSpace(p.DialerProxy); d != "" {
-		return config.Node{}, fmt.Errorf("dialer-proxy %q is not supported", d)
-	}
-
+	// A chained dialer-proxy means "reach this peer through another outbound".
+	// The field is imported as written; resolving the name to a tag and refusing
+	// the types whose socket layer cannot be chained happens once the whole
+	// document is known (see resolveDialerProxies and the type switch below).
 	n := config.Node{
-		Server:   server,
-		Port:     port,
-		AlterID:  asInt(p.AlterID),
-		Flow:     strings.TrimSpace(p.Flow),
-		Password: p.Password,
-		Method:   p.Cipher,
-		UDP:      p.UDP,
+		Server:      server,
+		Port:        port,
+		AlterID:     asInt(p.AlterID),
+		Flow:        strings.TrimSpace(p.Flow),
+		Password:    p.Password,
+		Method:      p.Cipher,
+		UDP:         p.UDP,
+		DialerProxy: strings.TrimSpace(p.DialerProxy),
 	}
 
 	switch typ {
@@ -270,6 +268,12 @@ func (p *clashProxy) node() (config.Node, error) {
 	case "ss", "shadowsocks":
 		n.Type = "ss"
 		n.Method = p.Cipher
+	case "socks5", "socks":
+		// A household or ISP-provided SOCKS5 exit. Clash spells the login as
+		// username/password; both empty means the server takes none.
+		n.Type = "socks5"
+		n.Username = strings.TrimSpace(p.Username)
+		n.Password = p.Password
 	case "hysteria2", "hy2":
 		n.Type = "hysteria2"
 	case "wireguard", "wg":
@@ -319,6 +323,20 @@ func (p *clashProxy) node() (config.Node, error) {
 		// A real proxy we cannot drive: skipping it silently would leave the user
 		// wondering why one node of the subscription is missing.
 		return config.Node{}, fmt.Errorf("unsupported proxy type %q", p.Type)
+	}
+
+	// A chain hands the TCP connection to the node's server to another outbound.
+	// hysteria2 speaks QUIC over its own UDP socket and WireGuard builds raw
+	// sockets in its userspace stack, so neither has a TCP connection to hand
+	// over; importing them anyway would dial the peer directly — from this
+	// device, with our address as the source — which is the failure the chain
+	// exists to prevent. Skip the node and say so.
+	if n.DialerProxy != "" {
+		switch n.Type {
+		case "hysteria2", "wireguard":
+			return config.Node{}, fmt.Errorf(
+				"dialer-proxy %q is not supported for %s: its transport is not TCP", n.DialerProxy, n.Type)
+		}
 	}
 
 	if server == "" || port <= 0 || port > 65535 {
@@ -441,4 +459,41 @@ func (p *clashProxy) node() (config.Node, error) {
 		}
 	}
 	return n, nil
+}
+
+// resolveDialerProxies turns each node's dialer-proxy name into the tag it became
+// and drops the node when that name is not part of this document.
+//
+// dialer-proxy names an outbound the same way a group member does, so it goes
+// through the same namespace: tag normalisation may rewrite it, de-duplication
+// may have merged it away, and the target may be a group, not only a `proxies:`
+// entry. A name that resolves to nothing is not a setting worth keeping — the
+// node would dial its server directly, from this device, which is exactly what
+// the chain exists to prevent — so the node is dropped and the error names both
+// ends, like a group member that names nothing.
+//
+// The namespace is only complete once the proxy-groups are parsed, so this runs
+// after parseClashGroups rather than inside clashProxy.node().
+func resolveDialerProxies(nodes []config.Node, ns *clashNamespace, errs *[]error) []config.Node {
+	out := make([]config.Node, 0, len(nodes))
+	for _, n := range nodes {
+		if n.DialerProxy == "" {
+			out = append(out, n)
+			continue
+		}
+		name := NormalizeTag(n.DialerProxy)
+		if tag, ok := ns.names[name]; ok {
+			n.DialerProxy = tag
+			out = append(out, n)
+			continue
+		}
+		if builtin, reserved := clashBuiltinTag(name); reserved {
+			n.DialerProxy = builtin
+			out = append(out, n)
+			continue
+		}
+		*errs = append(*errs, fmt.Errorf(
+			"share: node %q: dialer-proxy %q is not in this configuration", n.Tag, n.DialerProxy))
+	}
+	return out
 }

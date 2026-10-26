@@ -183,7 +183,7 @@ proxies:
       - 10.20.1.0/24
     mtu: 1420
   - name: "old-socks"
-    type: socks5
+    type: tuic
     server: 1.2.3.4
     port: 1080
     username: u
@@ -199,10 +199,10 @@ func TestParseClashWireGuard(t *testing.T) {
 		t.Fatalf("nodes = %d, want 2: %+v (errs %v)", len(nodes), nodes, errs)
 	}
 	if len(errs) != 1 {
-		t.Fatalf("errs = %v, want exactly the socks5 skip", errs)
+		t.Fatalf("errs = %v, want exactly the unsupported-type skip", errs)
 	}
-	if !strings.Contains(errs[0].Error(), "socks5") {
-		t.Fatalf("errs[0] = %v, want it to name socks5", errs[0])
+	if !strings.Contains(errs[0].Error(), "tuic") {
+		t.Fatalf("errs[0] = %v, want it to name tuic", errs[0])
 	}
 
 	first := nodes[0]

@@ -12,6 +12,7 @@ import (
 	"veil/internal/config"
 	"veil/internal/dns"
 	"veil/internal/outbound"
+	"veil/internal/proxy/factory"
 	"veil/internal/rules"
 )
 
@@ -41,12 +42,13 @@ func (e *Engine) Reload(cfg config.Config) error {
 	var buildErrs []string
 	for _, n := range cfg.Nodes {
 		nodes[n.Tag] = n
-		ob, err := e.buildOutbound(n)
-		if err != nil {
-			buildErrs = append(buildErrs, fmt.Sprintf("%s: %v", n.Tag, err))
-			continue
-		}
-		obs[n.Tag] = ob
+	}
+	built, chainErrs := factory.Build(cfg, e.resolveTag)
+	for _, err := range chainErrs {
+		buildErrs = append(buildErrs, err.Error())
+	}
+	for tag, ob := range built {
+		obs[tag] = ob
 	}
 	var groups []*Group
 	for _, g := range cfg.Groups {

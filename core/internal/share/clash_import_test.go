@@ -46,7 +46,7 @@ proxies:
     obfs: salamander
     obfs-password: obfspw
   - name: "old-socks"
-    type: socks5
+    type: tuic
     server: 1.2.3.4
     port: 1080
     username: u
@@ -80,10 +80,10 @@ func TestOwnerClashProfileImports(t *testing.T) {
 	// The skipped entries are counted and named, so the user learns why two of
 	// their five nodes are missing.
 	if len(errs) != 2 {
-		t.Fatalf("errs = %v, want exactly the socks5 and tuic skips", errs)
+		t.Fatalf("errs = %v, want exactly the tuic skips", errs)
 	}
 	joined := errs[0].Error() + " | " + errs[1].Error()
-	for _, want := range []string{"socks5", "tuic"} {
+	for _, want := range []string{"tuic"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("errs = %v, want %q named", errs, want)
 		}
@@ -366,5 +366,36 @@ proxies:
 	eq(t, "tag", nodes[0].Tag, "plain-peer")
 	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "amnezia-wg-option") {
 		t.Fatalf("errs = %v, want one about amnezia-wg-option", errs)
+	}
+}
+
+// A SOCKS5 exit is a supported outbound now: a household or ISP box usually
+// takes a username and password, which must survive the import.
+func TestClashSOCKS5NodeImports(t *testing.T) {
+	doc := `
+proxies:
+  - name: "home-broadband"
+    type: socks5
+    server: 203.0.113.9
+    port: 1080
+    username: nolan
+    password: s3cret
+    udp: true
+rules:
+  - MATCH,home-broadband
+`
+	cfg, errs := ParseClashConfig([]byte(doc), "clash")
+	if len(errs) != 0 {
+		t.Fatalf("errors: %v", errs)
+	}
+	if len(cfg.Nodes) != 1 {
+		t.Fatalf("nodes = %d, want 1", len(cfg.Nodes))
+	}
+	n := cfg.Nodes[0]
+	if n.Type != "socks5" || n.Username != "nolan" || n.Password != "s3cret" {
+		t.Fatalf("node = %+v, want socks5 with credentials", n)
+	}
+	if len(cfg.Rules) != 1 || cfg.Rules[0].Action != "home-broadband" {
+		t.Fatalf("rules = %+v", cfg.Rules)
 	}
 }

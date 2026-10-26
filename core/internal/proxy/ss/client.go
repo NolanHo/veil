@@ -51,7 +51,13 @@ var (
 
 // New builds a Shadowsocks client for n. For SIP022 methods n.Password is a
 // base64 PSK; for legacy methods it is a passphrase run through EVP_BytesToKey.
-func New(n config.Node) (*Client, error) {
+func New(n config.Node) (*Client, error) { return NewVia(n, nil) }
+
+// NewVia is New with the TCP connection to the server opened by base instead of
+// a direct dial, which is how a chained outbound (mihomo's `dialer-proxy`)
+// reaches its server through another proxy. A nil base dials directly, exactly
+// like New.
+func NewVia(n config.Node, base transport.Dialer) (*Client, error) {
 	m, err := CipherByName(n.Method)
 	if err != nil {
 		return nil, fmt.Errorf("ss %s: %w", n.Tag, err)
@@ -68,7 +74,7 @@ func New(n config.Node) (*Client, error) {
 		}
 		key = m.LegacyKey(n.Password)
 	}
-	dialer, err := transport.Build(n)
+	dialer, err := transport.BuildWith(n, base)
 	if err != nil {
 		return nil, fmt.Errorf("ss %s: %w", n.Tag, err)
 	}

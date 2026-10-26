@@ -32,7 +32,13 @@ var (
 // layers TLS (and any ws/grpc wrapping) on top of plain TCP for us. When the
 // node does not name a server name we default it to the server address so the
 // certificate is validated against the right host.
-func New(n config.Node) (*Client, error) {
+func New(n config.Node) (*Client, error) { return NewVia(n, nil) }
+
+// NewVia is New with the TCP connection to the server opened by base instead of
+// a direct dial: the TLS (and ws/grpc) stack is carried by that connection,
+// which is how a chained outbound (mihomo's `dialer-proxy`) reaches its server
+// through another proxy. A nil base dials directly, exactly like New.
+func NewVia(n config.Node, base transport.Dialer) (*Client, error) {
 	if n.Password == "" {
 		return nil, fmt.Errorf("trojan %q: empty password", n.Tag)
 	}
@@ -40,7 +46,7 @@ func New(n config.Node) (*Client, error) {
 		return nil, fmt.Errorf("trojan %q: invalid server %s:%d", n.Tag, n.Server, n.Port)
 	}
 
-	dialer, err := transport.Build(withTLSDefaults(n))
+	dialer, err := transport.BuildWith(withTLSDefaults(n), base)
 	if err != nil {
 		return nil, fmt.Errorf("trojan %q: build transport: %w", n.Tag, err)
 	}

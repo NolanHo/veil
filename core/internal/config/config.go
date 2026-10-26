@@ -27,6 +27,7 @@ type Node struct {
 	Server    string     `json:"server"`
 	Port      int        `json:"port"`
 	UUID      string     `json:"uuid,omitempty"`
+	Username  string     `json:"username,omitempty"` // socks5 login
 	Password  string     `json:"password,omitempty"`
 	Method    string     `json:"method,omitempty"` // shadowsocks cipher
 	Flow      string     `json:"flow,omitempty"`   // xtls-rprx-vision
@@ -36,6 +37,11 @@ type Node struct {
 	Transport *Transport `json:"transport,omitempty"`
 	Remark    string     `json:"remark,omitempty"` // display name from the share link
 	Source    string     `json:"source,omitempty"` // subscription name, empty for manual
+	// DialerProxy names the node or the group that carries this node's
+	// connection to its own server (mihomo's `dialer-proxy`): a chain. The value
+	// is a tag, resolved in the same namespace as a group member. Empty means
+	// this node dials its server directly, like every node without a chain.
+	DialerProxy string `json:"dialer_proxy,omitempty"`
 
 	// WireGuard. The endpoint lives in Server/Port like every other node; the
 	// keys are base64 as written by `wg genkey`, and the address sets are CIDR
