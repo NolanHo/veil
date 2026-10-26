@@ -132,8 +132,16 @@ func (e *Engine) Reload(cfg config.Config) error {
 	_ = oldRouter
 	// Give live connections a grace period on the old clients, then close the
 	// ones that are no longer referenced.
+	// A client rebuilt under the same tag is retired too, not just one whose tag
+	// disappeared: the old WireGuard device keeps its peer socket and the old
+	// QUIC connection keeps its keepalive, so leaving them alive would have the
+	// two fight over the same endpoint and wake the device for nothing.
 	retired := make(map[string]outbound.Outbound)
 	for tag, ob := range old {
+		if cur, keep := obs[tag]; keep && cur != ob {
+			retired[tag] = ob
+			continue
+		}
 		if _, keep := obs[tag]; !keep {
 			retired[tag] = ob
 		}
