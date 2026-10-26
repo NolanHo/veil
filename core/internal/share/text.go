@@ -13,10 +13,18 @@ import (
 // lines, comments ('#', '//') and stray markdown are ignored. When no line
 // carries a scheme the whole text is treated as a base64 subscription body.
 //
+// A wg-quick .conf is accepted too: its [Interface]/[Peer] header is the only
+// unambiguous marker in the input, so it is checked first (see isWireGuardConf)
+// and wins over the link and base64 branches. Without this branch the parser
+// would be dead code — the app has no other way to accept a pasted .conf.
+//
 // Parsing never aborts on a bad line: failures are collected in the second
 // return value so one broken link cannot discard a whole subscription.
 func ParseText(text string) ([]config.Node, []error) {
 	text = strings.TrimPrefix(text, "\ufeff")
+	if isWireGuardConf(text) {
+		return wireGuardConfNode(text, "")
+	}
 	var nodes []config.Node
 	var errs []error
 
@@ -40,8 +48,9 @@ func ParseText(text string) ([]config.Node, []error) {
 	}
 
 	if !seenLink {
-		// Possibly a base64-encoded subscription dumped as text.
-		if decoded := b64Text(text); decoded != "" && strings.Contains(decoded, "://") {
+		// Possibly a base64-encoded subscription dumped as text. The decoded body
+		// is a link list or, like any pasted text, a wg-quick .conf.
+		if decoded := b64Text(text); decoded != "" && (strings.Contains(decoded, "://") || isWireGuardConf(decoded)) {
 			return ParseText(decoded)
 		}
 		if strings.TrimSpace(text) == "" {
@@ -67,6 +76,11 @@ func ParseSubscription(body []byte, source string) ([]config.Node, []error) {
 	var errs []error
 
 	switch {
+	case isWireGuardConf(trimmed):
+		// Same precedence as ParseText: a .conf body names exactly one peer and
+		// carries no share link, so its section header decides before the
+		// link/YAML/base64 branches get a guess at the text.
+		nodes, errs = wireGuardConfNode(trimmed, "")
 	case strings.Contains(trimmed, "://"):
 		nodes, errs = ParseText(trimmed)
 	case looksLikeClash(trimmed):
@@ -102,8 +116,8 @@ func looksLikeClash(s string) bool {
 }
 
 // finalize de-duplicates nodes and makes every tag unique. Nodes are compared
-// on (type, server, port, credential, transport); the first occurrence wins.
-// Repeated tags get a "-2", "-3", ... suffix.
+// on identity (see dedupeKey); the first occurrence wins. Repeated tags get a
+// "-2", "-3", ... suffix.
 func finalize(nodes []config.Node) []config.Node {
 	out := make([]config.Node, 0, len(nodes))
 	seen := make(map[string]bool, len(nodes))
@@ -156,5 +170,17 @@ func dedupeKey(n config.Node) string {
 		}
 	}
 	return strings.ToLower(n.Type) + "|" + strings.ToLower(n.Server) + "|" +
-		strconv.Itoa(n.Port) + "|" + cred + "|" + tr + "|" + tlsPart
+		strconv.Itoa(n.Port) + "|" + cred + "|" + tr + "|" + tlsPart + "|" + wgIdentity(n)
+}
+
+// wgIdentity is the WireGuard half of the identity: two peers behind the same
+// endpoint with different keys, interface addresses, routes or keepalive are
+// different peers, and a key that ignored them would drop one silently.
+func wgIdentity(n config.Node) string {
+	if !strings.EqualFold(n.Type, "wireguard") {
+		return ""
+	}
+	return n.PrivateKey + "|" + n.PeerPublicKey + "|" + n.PresharedKey + "|" +
+		strings.Join(n.Addresses, ",") + "|" + strings.Join(n.AllowedIPs, ",") + "|" +
+		strings.Join(n.DNS, ",") + "|" + strconv.Itoa(n.MTU) + "|" + strconv.Itoa(n.KeepAlive)
 }

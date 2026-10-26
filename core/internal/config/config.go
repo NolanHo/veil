@@ -23,7 +23,7 @@ const (
 // Node is one upstream proxy endpoint.
 type Node struct {
 	Tag       string     `json:"tag"`
-	Type      string     `json:"type"` // vless | vmess | trojan | ss | hysteria2 | socks | http | direct
+	Type      string     `json:"type"` // vless | vmess | trojan | ss | hysteria2 | wireguard | socks | http | direct
 	Server    string     `json:"server"`
 	Port      int        `json:"port"`
 	UUID      string     `json:"uuid,omitempty"`
@@ -36,6 +36,18 @@ type Node struct {
 	Transport *Transport `json:"transport,omitempty"`
 	Remark    string     `json:"remark,omitempty"` // display name from the share link
 	Source    string     `json:"source,omitempty"` // subscription name, empty for manual
+
+	// WireGuard. The endpoint lives in Server/Port like every other node; the
+	// keys are base64 as written by `wg genkey`, and the address sets are CIDR
+	// lists because that is what a wg-quick .conf and the userspace stack use.
+	PrivateKey    string   `json:"private_key,omitempty"`
+	PeerPublicKey string   `json:"public_key,omitempty"`
+	PresharedKey  string   `json:"preshared_key,omitempty"`
+	Addresses     []string `json:"addresses,omitempty"`
+	AllowedIPs    []string `json:"allowed_ips,omitempty"`
+	MTU           int      `json:"mtu,omitempty"`       // 0 selects the WireGuard default (1420)
+	KeepAlive     int      `json:"keepalive,omitempty"` // PersistentKeepalive, seconds
+	DNS           []string `json:"dns,omitempty"`       // resolvers for the userspace stack
 }
 
 // Addr returns "host:port".
@@ -46,11 +58,20 @@ func (n Node) SupportsUDP() bool { return n.UDP == nil || *n.UDP }
 
 // TLS holds transport security settings.
 type TLS struct {
-	Enabled     bool     `json:"enabled"`
-	ServerName  string   `json:"server_name,omitempty"`
-	Insecure    bool     `json:"insecure,omitempty"`
-	ALPN        []string `json:"alpn,omitempty"`
-	Fingerprint string   `json:"fingerprint,omitempty"` // uTLS fingerprint: chrome, firefox, safari, randomized...
+	Enabled    bool     `json:"enabled"`
+	ServerName string   `json:"server_name,omitempty"`
+	Insecure   bool     `json:"insecure,omitempty"`
+	ALPN       []string `json:"alpn,omitempty"`
+	// Fingerprint is overloaded by shape, because Clash/mihomo put both meanings
+	// in this one key and users paste either:
+	//   - a hex SHA-256 digest (colons optional) pins the peer certificate, which
+	//     is how a Hysteria2 deployment with a self-signed cert is authenticated;
+	//   - a profile name ("chrome", "firefox", "randomized") selects a uTLS
+	//     ClientHello, which is what REALITY and the TLS-minor protocols need.
+	// A separate field would collide with this one's JSON tag (Go drops duplicate
+	// tags silently), so the shape decides; protocol packages that consume it
+	// must ask before treating a value as a name.
+	Fingerprint string   `json:"fingerprint,omitempty"`
 	Reality     *Reality `json:"reality,omitempty"`
 }
 
@@ -263,9 +284,23 @@ func (c *Config) Validate() error {
 			if n.Password == "" {
 				return fmt.Errorf("node %q: missing password", n.Tag)
 			}
+			// tls.fingerprint is not validated here on purpose: it is either a
+			// certificate pin or a uTLS profile name (see TLS.Fingerprint), and
+			// only the protocol that dials knows which shapes it can honour, so
+			// it reports the problem with the detail the user needs.
 		case "ss":
 			if n.Method == "" || n.Password == "" {
 				return fmt.Errorf("node %q: missing ss method/password", n.Tag)
+			}
+		case "wireguard", "wg":
+			if n.PrivateKey == "" || n.PeerPublicKey == "" {
+				return fmt.Errorf("node %q: missing wireguard private_key/public_key", n.Tag)
+			}
+			// The userspace stack has no interface address to send from without
+			// this, and every dial then fails with an opaque gVisor error; catch
+			// it while the UI can still explain it.
+			if len(n.Addresses) == 0 {
+				return fmt.Errorf("node %q: wireguard requires addresses", n.Tag)
 			}
 		}
 		if n.Transport != nil && n.Transport.Type != "" && n.Transport.Type != "tcp" && n.Transport.Type != "ws" && n.Transport.Type != "grpc" && n.Transport.Type != "h2" {

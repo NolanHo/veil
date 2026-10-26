@@ -13,6 +13,7 @@ import (
 	"veil/internal/proxy/trojan"
 	"veil/internal/proxy/vless"
 	"veil/internal/proxy/vmess"
+	"veil/internal/proxy/wireguard"
 	"veil/internal/transport"
 )
 
@@ -67,6 +68,8 @@ func New(n config.Node) (outbound.Outbound, error) {
 		return ss.New(n)
 	case "hysteria2", "hy2":
 		return hysteria2.New(n)
+	case "wireguard", "wg":
+		return wireguard.New(n)
 	case "direct":
 		return Direct{}, nil
 	case "reject":
