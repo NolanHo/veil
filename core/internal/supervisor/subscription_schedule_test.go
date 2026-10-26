@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"veil/internal/config"
+	"veil/internal/rpc"
 )
 
 // A subscription with an interval refreshes itself when the tunnel starts and the
@@ -77,5 +78,23 @@ func TestFreshSubscriptionIsNotRefreshed(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if n := hits.Load(); n != 0 {
 		t.Fatalf("fetched %d time(s), want none for a subscription that is not due", n)
+	}
+}
+
+// A stopped client has no live group member, but the card must still name the
+// node it would use instead of leaving the user with a blank "no node selected".
+func TestStoppedGroupsReportTheNodeTheyWouldUse(t *testing.T) {
+	sup := newRuleSupervisor(t)
+	if _, err := sup.Import(rpc.ImportParams{Text: routingYAML(), Source: "clash"}); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	groups := sup.Groups()
+	if len(groups) == 0 {
+		t.Fatal("no groups reported while stopped")
+	}
+	for _, g := range groups {
+		if g.Now == "" && len(g.Members) > 0 {
+			t.Fatalf("group %q reports no member while stopped; members=%v", g.Tag, g.Members)
+		}
 	}
 }

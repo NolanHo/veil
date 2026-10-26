@@ -132,3 +132,10 @@ routes those flows with the rest of its table.
 - The soak test (`core/internal/engine/soak_test.go`) opens thousands of
   connections and asserts that goroutines return to the baseline and that the
   registry is empty.
+- A url-test or fallback group arms its probe loop on the first connection that
+  dials through it, not at startup: an imported group nobody uses must not wake
+  the device every interval.
+- Measured on the device (MatePad Mini, tunnel up and idle for 61 s, no traffic):
+  0.00 % of one core across `com.nolanho.kitsune` and its `:vpn` process, two
+  log lines. The watchdog ticks every 5 s but only logs when the status actually
+  changed, and probes the inbound every 30 s.

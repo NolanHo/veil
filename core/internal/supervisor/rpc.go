@@ -221,7 +221,13 @@ func (s *Supervisor) Groups() []state.GroupStatus {
 	out := make([]state.GroupStatus, 0, len(cfg.Nodes)+len(cfg.Groups))
 	if len(cfg.Groups) > 0 {
 		for _, g := range cfg.Groups {
-			gs := state.GroupStatus{Tag: g.Tag, Type: g.Type, Now: g.Selected}
+			// Nothing pinned yet: report what the engine would use, so a stopped
+			// client shows the node it is about to dial instead of a blank.
+			now := g.Selected
+			if now == "" && len(g.Members) > 0 {
+				now = g.Members[0]
+			}
+			gs := state.GroupStatus{Tag: g.Tag, Type: g.Type, Now: now}
 			for _, m := range g.Members {
 				gs.Members = append(gs.Members, state.NodeStatus{Tag: m, Type: nodeType(cfg, m), DelayMS: -1})
 			}
