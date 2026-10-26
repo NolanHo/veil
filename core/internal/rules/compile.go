@@ -43,6 +43,11 @@ type compiled struct {
 	portHi  uint16
 	network string // lowercase tcp / udp
 	process string // basename, lowercase
+
+	// noResolve carries Clash's `no-resolve` flag on IP rules. It says "judge
+	// this rule on the address the client sent; do not turn the name into an
+	// address for it". Only the IP kinds (ip-cidr, ip-cidr6, geoip) read it.
+	noResolve bool
 }
 
 // compile parses rs into matchable form. Rule order is preserved: the matcher
@@ -59,6 +64,7 @@ func compile(rs []config.Rule) ([]compiled, error) {
 				Outbound: actName,
 				Reject:   strings.EqualFold(actName, "reject"),
 			},
+			noResolve: r.NoResolve,
 		}
 
 		switch typ {
@@ -152,8 +158,8 @@ func compile(rs []config.Rule) ([]compiled, error) {
 }
 
 // match reports whether m satisfies c. Domain-ish rules are skipped when the
-// client sent a bare IP (Host empty), IP rules when Dst is invalid, so a rule
-// never fires on a prerequisite it cannot evaluate.
+// client sent a bare IP (Host empty), IP rules when no usable address is
+// available, so a rule never fires on a prerequisite it cannot evaluate.
 func (c compiled) match(m Meta) bool {
 	switch c.kind {
 	case kindFinal:
@@ -179,19 +185,19 @@ func (c compiled) match(m Meta) bool {
 		return false
 
 	case kindIPCIDR:
-		if !m.Dst.IsValid() {
+		if !c.dstUsable(m) {
 			return false
 		}
 		return c.prefix.Contains(m.Dst)
 
 	case kindGeoIPPrivate:
-		if !m.Dst.IsValid() {
+		if !c.dstUsable(m) {
 			return false
 		}
 		return isPrivateAddr(m.Dst)
 
 	case kindGeoIPCN:
-		if !m.Dst.IsValid() {
+		if !c.dstUsable(m) {
 			return false
 		}
 		a := m.Dst.Unmap()
@@ -210,6 +216,10 @@ func (c compiled) match(m Meta) bool {
 		return strings.EqualFold(m.Network, c.network)
 
 	case kindProcess:
+		// Nothing fills Meta.Process yet: HarmonyOS hands the tun packets over
+		// without the owning uid, so a process rule can only ever miss. It stays
+		// compiled (a config must import), but the match below is unreachable in
+		// production until the netstack/inbound path learns the app identity.
 		if m.Process == "" {
 			return false
 		}
@@ -217,6 +227,20 @@ func (c compiled) match(m Meta) bool {
 		return strings.ToLower(filepath.Base(m.Process)) == c.process
 	}
 	return false
+}
+
+// dstUsable reports whether an IP rule may look at m.Dst.
+//
+// A rule marked no-resolve exists to say "decide on the address the client sent,
+// do not resolve the name for me". The engine resolves a name exactly once, for
+// the rules that do want an address (see engine.route), and flags the result in
+// Meta.DstFromLookup; without this check that single lookup would silently feed
+// every no-resolve rule in the table and undo the user's choice.
+func (c compiled) dstUsable(m Meta) bool {
+	if !m.Dst.IsValid() {
+		return false
+	}
+	return !c.noResolve || !m.DstFromLookup
 }
 
 // normalizeDomain lowercases and strips the trailing dot (FQDN form), which is

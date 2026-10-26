@@ -3,6 +3,7 @@ package rules
 
 import (
 	"net/netip"
+	"strings"
 
 	"veil/internal/config"
 )
@@ -14,6 +15,11 @@ type Meta struct {
 	Dst     netip.Addr
 	Port    uint16
 	Process string
+
+	// DstFromLookup marks Dst as filled by the router's own DNS lookup rather
+	// than read from the client's packet. Rules carrying `no-resolve` must not
+	// match such an address; see compiled.dstUsable.
+	DstFromLookup bool
 }
 
 // Action is the routing decision.
@@ -43,7 +49,8 @@ func New(rs []config.Rule, mode, final string) (*Engine, error) {
 }
 
 // Match returns the first matching action. It never blocks and never performs
-// DNS lookups.
+// DNS lookups: a caller that wants IP rules to see a resolved address fills
+// Meta.Dst itself (engine.route does) and flags it with DstFromLookup.
 func (e *Engine) Match(m Meta) Action {
 	switch e.mode {
 	case config.ModeGlobal:
@@ -57,4 +64,20 @@ func (e *Engine) Match(m Meta) Action {
 		}
 	}
 	return Action{Outbound: e.final}
+}
+
+// NeedsIP reports whether any rule in rs can only be evaluated with a
+// destination address. Rules marked `no-resolve` do not count: they must never
+// be the reason a domain gets looked up.
+func NeedsIP(rs []config.Rule) bool {
+	for _, r := range rs {
+		if r.NoResolve {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(r.Type)) {
+		case "ip-cidr", "ip-cidr6", "geoip":
+			return true
+		}
+	}
+	return false
 }

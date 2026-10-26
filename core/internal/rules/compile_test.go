@@ -277,3 +277,66 @@ func BenchmarkEngineMatch(b *testing.B) {
 		}
 	}
 }
+
+// TestNoResolveIgnoresLookedUpDst covers Clash's `no-resolve`: an IP rule with
+// the flag must not be satisfied by an address the router looked up itself (the
+// engine flags that in Meta.DstFromLookup), while a rule without the flag uses
+// it. A client-sent IP still satisfies either kind.
+func TestNoResolveIgnoresLookedUpDst(t *testing.T) {
+	tests := []struct {
+		name string
+		rule config.Rule
+		meta Meta
+		want bool
+	}{
+		{"cidr no-resolve skips looked-up", config.Rule{Type: "ip-cidr", Value: "223.5.5.5/32", NoResolve: true}, Meta{Host: "cn.example.com", Dst: addr("223.5.5.5"), DstFromLookup: true}, false},
+		{"cidr no-resolve keeps client ip", config.Rule{Type: "ip-cidr", Value: "223.5.5.5/32", NoResolve: true}, Meta{Dst: addr("223.5.5.5")}, true},
+		{"cidr with resolve skips nothing", config.Rule{Type: "ip-cidr", Value: "223.5.5.5/32"}, Meta{Host: "cn.example.com", Dst: addr("223.5.5.5"), DstFromLookup: true}, true},
+		{"cidr6 no-resolve skips looked-up", config.Rule{Type: "ip-cidr6", Value: "2001:db8::/32", NoResolve: true}, Meta{Host: "v6.example.com", Dst: addr("2001:db8::1"), DstFromLookup: true}, false},
+		{"cidr6 with resolve uses looked-up", config.Rule{Type: "ip-cidr6", Value: "2001:db8::/32"}, Meta{Host: "v6.example.com", Dst: addr("2001:db8::1"), DstFromLookup: true}, true},
+		{"geoip cn no-resolve skips looked-up", config.Rule{Type: "geoip", Value: "cn", NoResolve: true}, Meta{Host: "cn.example.com", Dst: addr("223.5.5.5"), DstFromLookup: true}, false},
+		{"geoip cn with resolve uses looked-up", config.Rule{Type: "geoip", Value: "cn"}, Meta{Host: "cn.example.com", Dst: addr("223.5.5.5"), DstFromLookup: true}, true},
+		{"geoip private no-resolve skips looked-up", config.Rule{Type: "geoip", Value: "private", NoResolve: true}, Meta{Host: "nas.lan", Dst: addr("192.168.1.9"), DstFromLookup: true}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cs, err := compile([]config.Rule{tt.rule})
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			if got := cs[0].match(tt.meta); got != tt.want {
+				t.Fatalf("match(%+v) = %v, want %v", tt.meta, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNeedsIP pins down what makes the engine resolve: an IP rule that is
+// allowed to use the answer, and nothing else.
+func TestNeedsIP(t *testing.T) {
+	tests := []struct {
+		name  string
+		rules []config.Rule
+		want  bool
+	}{
+		{"empty", nil, false},
+		{"domain only", []config.Rule{{Type: "domain-suffix", Value: "cn"}}, false},
+		{"ip-cidr", []config.Rule{{Type: "ip-cidr", Value: "10.0.0.0/8"}}, true},
+		{"ip-cidr uppercase", []config.Rule{{Type: "IP-CIDR", Value: "10.0.0.0/8"}}, true},
+		{"ip-cidr6", []config.Rule{{Type: "ip-cidr6", Value: "2001:db8::/32"}}, true},
+		{"geoip", []config.Rule{{Type: "geoip", Value: "cn"}}, true},
+		{"no-resolve ip-cidr", []config.Rule{{Type: "ip-cidr", Value: "10.0.0.0/8", NoResolve: true}}, false},
+		{"no-resolve geoip", []config.Rule{{Type: "geoip", Value: "cn", NoResolve: true}}, false},
+		{"one resolvable among no-resolve", []config.Rule{
+			{Type: "ip-cidr", Value: "10.0.0.0/8", NoResolve: true},
+			{Type: "geoip", Value: "cn"},
+		}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NeedsIP(tt.rules); got != tt.want {
+				t.Fatalf("NeedsIP(%v) = %v, want %v", tt.rules, got, tt.want)
+			}
+		})
+	}
+}

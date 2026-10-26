@@ -61,6 +61,10 @@ type Engine struct {
 
 	udpCache    sync.Map
 	udpSessions atomic.Int64
+
+	// routeCache memoises the DNS lookups rule matching performs. Zero value is
+	// ready to use; see routecache.go for why the engine keeps its own.
+	routeCache routeAddrCache
 }
 
 // New validates cfg and prepares an engine. It does not open sockets.
@@ -82,12 +86,9 @@ func New(cfg config.Config, log *logx.Logger) (*Engine, error) {
 	for _, n := range cfg.Nodes {
 		e.nodes[n.Tag] = n
 	}
-	for _, r := range cfg.Rules {
-		switch r.Type {
-		case "ip-cidr", "ip-cidr6", "geoip":
-			e.needsIP = true
-		}
-	}
+	// Only rules that want an address make the router resolve: a table whose IP
+	// rules are all `no-resolve` must never look a name up.
+	e.needsIP = rules.NeedsIP(cfg.Rules)
 	return e, nil
 }
 

@@ -111,13 +111,7 @@ func (e *Engine) Reload(cfg config.Config) error {
 	oldGroups := e.groups
 	oldResolver := e.resolver
 	oldRouter := e.router
-	needsIP := false
-	for _, r := range cfg.Rules {
-		switch r.Type {
-		case "ip-cidr", "ip-cidr6", "geoip":
-			needsIP = true
-		}
-	}
+	needsIP := rules.NeedsIP(cfg.Rules)
 	e.cfg = cfg
 	e.outbounds = obs
 	e.nodes = nodes
@@ -131,6 +125,12 @@ func (e *Engine) Reload(cfg config.Config) error {
 
 	for _, g := range oldGroups {
 		g.stop()
+	}
+	// Groups published by this reload need their own lifecycle: a url-test or
+	// fallback group that never starts never probes, so an imported group would
+	// stay frozen on its first member until the app restarts.
+	for _, g := range groups {
+		g.start(e.ctx)
 	}
 	if oldResolver != nil {
 		_ = oldResolver.Close()

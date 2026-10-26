@@ -17,40 +17,47 @@ func (e *Engine) route(ctx context.Context, network, target string) (outbound.Ou
 	if err != nil {
 		return nil, rules.Action{}, target, err
 	}
-	// A fake address stands for a domain: hand the name to the proxy so the
-	// lookup happens at the exit node (remote DNS), never on this device.
-	fromFake := false
-	if host == "" && ip.IsValid() && e.resolver != nil && e.resolver.IsFake(ip) {
-		if name, ok := e.resolver.HostFor(ip); ok {
+	// The matcher, the resolver and the "does any IP rule exist" flag are
+	// replaced by SetMode and Reload. Snapshot them under the lock: the matcher
+	// object is immutable, but the pointers are not safe to read concurrently
+	// with a write.
+	e.mu.RLock()
+	router, needsIP, resolver := e.router, e.needsIP, e.resolver
+	e.mu.RUnlock()
+
+	// A fake address stands for a domain. Recover the name so domain rules can
+	// see it and so the outbound dials by hostname.
+	if host == "" && ip.IsValid() && resolver != nil && resolver.IsFake(ip) {
+		if name, ok := resolver.HostFor(ip); ok {
 			host = name
 			ip = netip.Addr{}
 			target = net.JoinHostPort(name, fmt.Sprint(port))
-			fromFake = true
 		}
 	}
 
 	meta := rules.Meta{Network: network, Host: host, Dst: ip, Port: port}
 
-	// The matcher and the "does any IP rule exist" flag are replaced by SetMode
-	// and Reload. Publish them under the lock: the matcher object is immutable,
-	// but the pointer itself is not safe to read concurrently with a write.
-	e.mu.RLock()
-	router, needsIP, resolver := e.router, e.needsIP, e.resolver
-	e.mu.RUnlock()
-
-	// IP-based rules (geoip / CIDR) need an address. Resolve once, with a
-	// short budget, and keep the domain for the outbound dial so the remote
-	// side still sees the hostname.
-	// A fake address has no real IP by design: resolving it locally would leak
-	// the name and stall for seconds. The proxy resolves it.
-	if needsIP && host != "" && resolver != nil && !fromFake {
-		rctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		addrs, err := resolver.Lookup(rctx, host)
-		cancel()
+	// IP-based rules (geoip / CIDR) need an address, and a fake address is not
+	// one: it only carries the name the client asked for. Leaving it unresolved
+	// made every IP rule dead for fake-IP flows, so domestic sites that a Clash
+	// config routes with `GEOIP,CN,DIRECT` fell through to MATCH and went out
+	// through the proxy. Resolve the name, hand the address to the matcher, and
+	// keep the hostname in `target` — the exit node still performs the
+	// authoritative lookup, this one only classifies the connection.
+	//
+	// Rules marked `no-resolve` are deliberately excluded from "needsIP" and do
+	// not accept this address (see rules.Meta.DstFromLookup); resolving for them
+	// would be the very leak the flag asks us to avoid.
+	if needsIP && host != "" && resolver != nil {
+		addrs, err := e.lookupForRoute(ctx, resolver, host)
 		if err != nil {
+			// No address is a normal outcome: NXDOMAIN, a blocked upstream, or a
+			// fake-IP name that does not exist on the wire. IP rules then see an
+			// unresolved target and the remaining rules still get their chance.
 			e.log.Debugf("resolve %s for routing failed: %v", host, err)
 		} else if len(addrs) > 0 {
 			meta.Dst = addrs[0]
+			meta.DstFromLookup = true
 		}
 	}
 

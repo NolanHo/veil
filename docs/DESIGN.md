@@ -77,8 +77,34 @@ socks5/http (mixed)  ──┼─▶ engine.HandleTCP ─▶ route ─▶ group 
                        └─▶ engine.HandleUDP ─▶ route ─▶ udp association cache
 ```
 
-Routing resolves a domain only when the rule set contains IP rules; the
-outbound still receives the hostname so the exit node does the DNS lookup.
+Routing resolves a domain when the rule set contains an IP rule
+(`GEOIP`, `IP-CIDR`, `IP-CIDR6`) that is allowed to use the answer. The lookup
+goes through the engine's own resolver — the configured DoH/DoT upstreams, on the
+same detour-aware path the tunnel DNS uses, never the OS resolver — with a 3 s
+budget and a one-minute cache in the engine, so a page load with dozens of
+connections costs one query. The outbound still receives the hostname, so the
+exit node performs the authoritative lookup; the local one only classifies
+traffic.
+
+This includes flows that arrive on a fake-IP address. A fake address
+(198.18.0.0/15) carries nothing but the requested name, so with fake-IP enabled
+*every* connection needs that lookup before an IP rule can match — without it
+`GEOIP,CN,DIRECT` never fires and domestic traffic falls through to `MATCH`.
+A failed lookup is not fatal: rules that need an address simply do not match, a
+debug line records why, and evaluation continues.
+
+`no-resolve` is honoured in both directions. Such a rule never makes the router
+resolve, and it never matches an address the router looked up — it only sees a
+destination the client sent literally (`rules.Meta.DstFromLookup`), so a
+`IP-CIDR,...,no-resolve` rule cannot be fed by a lookup performed for some other
+rule.
+
+`PROCESS-NAME` / `PROCESS-PATH` rules import and compile but never match: the tun
+hands over packets without the owning application, so `rules.Meta.Process` stays
+empty. Making them work requires the ArkTS side to supply an app identity for a
+flow (uid → bundle name via `bundleManager`, delivered to the Go side per
+connection); until that exists a config that relies on process rules simply
+routes those flows with the rest of its table.
 
 ## Resource discipline
 
