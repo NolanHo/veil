@@ -22,11 +22,11 @@ proxies:
     type: wireguard
     server: 203.0.113.10
     port: 51820
-    ip: 10.173.91.13
+    ip: 10.9.0.13
     private-key: PRIV
     public-key: PUB
-    allowed-ips: ['10.173.91.0/24']
-    dns: [10.173.91.1]
+    allowed-ips: ['10.9.0.0/24']
+    dns: [10.9.0.1]
     mtu: 1280
     udp: true
   - name: "hy2-hk"
@@ -63,7 +63,7 @@ rules:
   - DOMAIN-SUFFIX,baidu.com,DIRECT
   - DOMAIN-SUFFIX,cn,DIRECT
   - GEOIP,CN,DIRECT
-  - IP-CIDR,10.173.91.0/24,homelab,no-resolve
+  - IP-CIDR,10.9.0.0/24,homelab,no-resolve
   - GEOSITE,geolocation-!cn,选择代理
   - RULE-SET,reject-list,REJECT
   - MATCH,选择代理
@@ -130,7 +130,7 @@ func TestOwnerClashRoutingImports(t *testing.T) {
 		{Type: "domain-suffix", Value: "baidu.com", Action: "direct"},
 		{Type: "domain-suffix", Value: "cn", Action: "direct"},
 		{Type: "geoip", Value: "cn", Action: "direct"},
-		{Type: "ip-cidr", Value: "10.173.91.0/24", Action: "homelab", NoResolve: true},
+		{Type: "ip-cidr", Value: "10.9.0.0/24", Action: "homelab", NoResolve: true},
 		{Type: "final", Action: "选择代理"},
 	}
 	if !reflect.DeepEqual(cfg.Rules, wantRules) {
@@ -183,9 +183,9 @@ func TestOwnerClashRouteDecisions(t *testing.T) {
 	}{
 		{
 			name: "homelab subnet",
-			meta: rules.Meta{Network: "tcp", Dst: netip.MustParseAddr("10.173.91.20"), Port: 443},
+			meta: rules.Meta{Network: "tcp", Dst: netip.MustParseAddr("10.9.0.20"), Port: 443},
 			want: "homelab",
-			rule: "ip-cidr:10.173.91.0/24",
+			rule: "ip-cidr:10.9.0.0/24",
 		},
 		{
 			name: "domestic domain",

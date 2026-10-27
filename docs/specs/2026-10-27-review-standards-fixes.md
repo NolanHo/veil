@@ -83,7 +83,7 @@ an error like `dialer-proxy` — not imported as a differently-behaving node.
 
 **S12 — `.conf` export allows directive injection**
 `share/wireguard.go:173-178`. A value containing a newline injects a new
-directive (`DNS: "10.173.91.1\nPostUp = ..."`). Reject values containing
+directive (`DNS: "10.9.0.1\nPostUp = ..."`). Reject values containing
 newlines/whitespace that cannot be represented in the line format.
 
 ## Nit

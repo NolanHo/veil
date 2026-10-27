@@ -17,25 +17,25 @@ func ownerClashYAML() string {
 proxies:
   - name: "homelab-wg"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.173.91.13
+    ip: 10.9.0.13
     private-key: %s
     public-key: %s
     pre-shared-key: %s
-    allowed-ips: ['10.173.91.0/24']
-    dns: [10.173.91.1]
+    allowed-ips: ['10.9.0.0/24']
+    dns: [10.9.0.1]
     mtu: 1280
     udp: true
   - name: "relay-wg"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51821
-    ip: 10.20.1.13
+    ip: 10.20.30.13
     ipv6: fd00::13
     private-key: %s
     public-key: %s
-    allowed-ips: ['10.20.1.0/24', 'fd00::/64']
+    allowed-ips: ['10.20.30.0/24', 'fd00::/64']
   - name: "hy2-hk"
     type: hysteria2
     server: hk.example.net
@@ -108,20 +108,20 @@ func TestClashDedupeKeepsDistinctWireGuardPeers(t *testing.T) {
 proxies:
   - name: "lab"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.173.91.13
+    ip: 10.9.0.13
     private-key: %s
     public-key: %s
-    allowed-ips: ['10.173.91.0/24']
+    allowed-ips: ['10.9.0.0/24']
   - name: "lab-2"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.20.1.13
+    ip: 10.20.30.13
     private-key: %s
     public-key: %s
-    allowed-ips: ['10.20.1.0/24']
+    allowed-ips: ['10.20.30.0/24']
 `, testPrivKey, testPubKey, testPrivKey, testPSK)
 
 	nodes, errs := ParseClashYAML([]byte(doc), "sub")
@@ -131,8 +131,8 @@ proxies:
 	if len(nodes) != 2 {
 		t.Fatalf("nodes = %d (%+v), want 2: the peers differ in address, key and route", len(nodes), nodes)
 	}
-	eq(t, "addresses0", strings.Join(nodes[0].Addresses, ","), "10.173.91.13/32")
-	eq(t, "addresses1", strings.Join(nodes[1].Addresses, ","), "10.20.1.13/32")
+	eq(t, "addresses0", strings.Join(nodes[0].Addresses, ","), "10.9.0.13/32")
+	eq(t, "addresses1", strings.Join(nodes[1].Addresses, ","), "10.20.30.13/32")
 	eq(t, "public_key1", nodes[1].PeerPublicKey, testPSK)
 	if nodes[0].Tag == nodes[1].Tag {
 		t.Fatalf("both peers got the tag %q", nodes[0].Tag)
@@ -230,23 +230,23 @@ func TestClashAllowedIPsRejectsMappingShape(t *testing.T) {
 proxies:
   - name: "mapping-routes"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.173.91.13
+    ip: 10.9.0.13
     private-key: %s
     public-key: %s
     allowed-ips:
-      typo: 10.173.91.0/24
+      typo: 10.9.0.0/24
   - name: "mapping-dns"
     type: wireguard
-    server: 115.191.57.107
+    server: 198.51.100.11
     port: 51820
-    ip: 10.173.91.14
+    ip: 10.9.0.14
     private-key: %s
     public-key: %s
-    allowed-ips: ['10.173.91.0/24']
+    allowed-ips: ['10.9.0.0/24']
     dns:
-      typo: 10.173.91.1
+      typo: 10.9.0.1
 `, testPrivKey, testPubKey, testPrivKey, testPubKey)
 
 	nodes, errs := ParseClashYAML([]byte(doc), "sub")
@@ -272,9 +272,9 @@ func TestClashWireGuardDefaultsAllowedIPs(t *testing.T) {
 proxies:
   - name: "v4-only"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.173.91.13
+    ip: 10.9.0.13
     private-key: %s
     public-key: %s
 `, testPrivKey, testPubKey)
@@ -284,8 +284,8 @@ proxies:
 	}
 	eq(t, "allowed_ips", strings.Join(nodes[0].AllowedIPs, ","), "0.0.0.0/0")
 
-	dual := strings.Replace(v4, "    ip: 10.173.91.13",
-		"    ip: 10.173.91.13\n    ipv6: fd00::13", 1)
+	dual := strings.Replace(v4, "    ip: 10.9.0.13",
+		"    ip: 10.9.0.13\n    ipv6: fd00::13", 1)
 	nodes, errs = ParseClashYAML([]byte(dual), "sub")
 	if len(errs) != 0 || len(nodes) != 1 {
 		t.Fatalf("ParseClashYAML = %+v, %v", nodes, errs)
@@ -294,12 +294,12 @@ proxies:
 
 	// An explicit list is never overridden.
 	explicit := strings.Replace(v4, "    private-key: "+testPrivKey,
-		"    allowed-ips: ['10.173.91.0/24']\n    private-key: "+testPrivKey, 1)
+		"    allowed-ips: ['10.9.0.0/24']\n    private-key: "+testPrivKey, 1)
 	nodes, errs = ParseClashYAML([]byte(explicit), "sub")
 	if len(errs) != 0 || len(nodes) != 1 {
 		t.Fatalf("ParseClashYAML = %+v, %v", nodes, errs)
 	}
-	eq(t, "allowed_ips", strings.Join(nodes[0].AllowedIPs, ","), "10.173.91.0/24")
+	eq(t, "allowed_ips", strings.Join(nodes[0].AllowedIPs, ","), "10.9.0.0/24")
 }
 
 // TestClashWireGuardReservedSkipped is the S11 regression: `reserved` changes the
@@ -310,12 +310,12 @@ func TestClashWireGuardReservedSkipped(t *testing.T) {
 proxies:
   - name: "reserved-peer"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.173.91.13
+    ip: 10.9.0.13
     private-key: %s
     public-key: %s
-    allowed-ips: ['10.173.91.0/24']
+    allowed-ips: ['10.9.0.0/24']
     reserved: [0, 0, 0]
 `, testPrivKey, testPubKey)
 
@@ -339,23 +339,23 @@ func TestClashWireGuardAmneziaOptionSkipped(t *testing.T) {
 proxies:
   - name: "amnezia-peer"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.173.91.13
+    ip: 10.9.0.13
     private-key: %s
     public-key: %s
-    allowed-ips: ['10.173.91.0/24']
+    allowed-ips: ['10.9.0.0/24']
     amnezia-wg-option:
       jc: 3
       jmin: 10
   - name: "plain-peer"
     type: wireguard
-    server: 115.191.57.107
+    server: 198.51.100.11
     port: 51820
-    ip: 10.173.91.14
+    ip: 10.9.0.14
     private-key: %s
     public-key: %s
-    allowed-ips: ['10.173.91.0/24']
+    allowed-ips: ['10.9.0.0/24']
     reserved: []
 `, testPrivKey, testPubKey, testPrivKey, testPubKey)
 

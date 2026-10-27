@@ -26,8 +26,8 @@ func wgNode() Node {
 		Port:          51820,
 		PrivateKey:    priv,
 		PeerPublicKey: pub,
-		Addresses:     []string{"10.173.91.200/32"},
-		AllowedIPs:    []string{"10.173.91.0/24"},
+		Addresses:     []string{"10.9.0.200/32"},
+		AllowedIPs:    []string{"10.9.0.0/24"},
 	}
 }
 
@@ -76,7 +76,7 @@ func TestWireGuardJSONRoundTrip(t *testing.T) {
 	cfg.Nodes[0].PresharedKey = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x33}, 32))
 	cfg.Nodes[0].MTU = 1420
 	cfg.Nodes[0].KeepAlive = 25
-	cfg.Nodes[0].DNS = []string{"10.173.91.1"}
+	cfg.Nodes[0].DNS = []string{"10.9.0.1"}
 
 	blob, err := json.Marshal(cfg)
 	if err != nil {

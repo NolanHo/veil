@@ -11,7 +11,7 @@ proxy-providers:
     proxy: mdev-hk
     type: http
     url: "http://provider.invalid/sub"
-    path: ./ssrdog.yml
+    path: ./airport.yaml
     interval: 86400
     override:
       udp: true
@@ -159,13 +159,13 @@ rule-providers:
     format: mrs
     path: ./ruleset/reject.mrs
 hosts:
-  "dsh-nolan.apeiria.cn": 203.0.113.10
+  "dsh-owner.example": 203.0.113.10
 rules:
-  - DOMAIN,xbot.macaron.xin,Nolan-Lab
-  - DOMAIN,dsh-nolan.apeiria.cn,DIRECT
+  - DOMAIN,xbot.example,Nolan-Lab
+  - DOMAIN,dsh-owner.example,DIRECT
   - IP-CIDR,203.0.113.10/32,DIRECT,no-resolve
   - IP-CIDR,10.9.0.0/24,Nolan-Lab,no-resolve
-  - DOMAIN-SUFFIX,apeiria.cn,Nolan-Lab
+  - DOMAIN-SUFFIX,owner.example.net,Nolan-Lab
   - IP-CIDR,10.9.1.0/24,gz-relay,no-resolve
   - 'DOMAIN-SUFFIX,openrouter.ai,出口包装'
   - 'DOMAIN-SUFFIX,semanticscholar.org,出口包装'

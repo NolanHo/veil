@@ -16,8 +16,8 @@ func wgNode(typ string) config.Node {
 		Port:          51820,
 		PrivateKey:    base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32)),
 		PeerPublicKey: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x22}, 32)),
-		Addresses:     []string{"10.173.91.200/32"},
-		AllowedIPs:    []string{"10.173.91.0/24"},
+		Addresses:     []string{"10.9.0.200/32"},
+		AllowedIPs:    []string{"10.9.0.0/24"},
 	}
 }
 

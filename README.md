@@ -62,7 +62,7 @@ scripts/build-core.sh          # produces entry/src/main/libs/arm64-v8a/libveil.
 
 Paste the profile you already run elsewhere — Clash Verge, mihomo, whatever
 writes a Clash document — into **规则 → 导入**. Proxies, `proxy-groups` and
-`rules` all come across, so a profile that sends `10.20.1.0/24` to a WireGuard
+`rules` all come across, so a profile that sends `10.20.30.0/24` to a WireGuard
 peer and everything else through a Hysteria2 node works without retyping the
 routing. WireGuard peers can also be pasted as a `wg-quick` `.conf`.
 

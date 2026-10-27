@@ -26,14 +26,14 @@ func wgConfText() string {
 	return fmt.Sprintf(`# homelab
 [Interface]
 PrivateKey = %s
-Address = 10.173.91.200/32, fd00::2/128
-DNS = 10.173.91.1
+Address = 10.9.0.200/32, fd00::2/128
+DNS = 10.9.0.1
 MTU = 1420
 
 [Peer]
 PublicKey = %s
 PresharedKey = %s
-AllowedIPs = 10.173.91.0/24, fd00::/64
+AllowedIPs = 10.9.0.0/24, fd00::/64
 Endpoint = wg.homelab.example:51820
 PersistentKeepalive = 25
 `, testPrivKey, testPubKey, testPSK)
@@ -52,9 +52,9 @@ func TestParseWireGuardConf(t *testing.T) {
 	eq(t, "preshared_key", n.PresharedKey, testPSK)
 	eq(t, "mtu", strconv.Itoa(n.MTU), "1420")
 	eq(t, "keepalive", strconv.Itoa(n.KeepAlive), "25")
-	eq(t, "addresses", strings.Join(n.Addresses, ","), "10.173.91.200/32,fd00::2/128")
-	eq(t, "allowed_ips", strings.Join(n.AllowedIPs, ","), "10.173.91.0/24,fd00::/64")
-	eq(t, "dns", strings.Join(n.DNS, ","), "10.173.91.1")
+	eq(t, "addresses", strings.Join(n.Addresses, ","), "10.9.0.200/32,fd00::2/128")
+	eq(t, "allowed_ips", strings.Join(n.AllowedIPs, ","), "10.9.0.0/24,fd00::/64")
+	eq(t, "dns", strings.Join(n.DNS, ","), "10.9.0.1")
 	// The tag comes from the imported name, which is what the node list shows.
 	eq(t, "tag", n.Tag, "homelab")
 	eq(t, "remark", n.Remark, "homelab")
@@ -98,12 +98,12 @@ func TestWireGuardConfRoundTrip(t *testing.T) {
 	for _, want := range []string{
 		"[Interface]",
 		"PrivateKey = " + testPrivKey,
-		"Address = 10.173.91.200/32, fd00::2/128",
-		"DNS = 10.173.91.1",
+		"Address = 10.9.0.200/32, fd00::2/128",
+		"DNS = 10.9.0.1",
 		"MTU = 1420",
 		"[Peer]",
 		"PresharedKey = " + testPSK,
-		"AllowedIPs = 10.173.91.0/24, fd00::/64",
+		"AllowedIPs = 10.9.0.0/24, fd00::/64",
 		"Endpoint = wg.homelab.example:51820",
 		"PersistentKeepalive = 25",
 	} {
@@ -121,8 +121,8 @@ func TestWireGuardConfRoundTrip(t *testing.T) {
 }
 
 func TestParseWireGuardConfErrors(t *testing.T) {
-	iface := fmt.Sprintf("[Interface]\nPrivateKey = %s\nAddress = 10.173.91.200/32\n", testPrivKey)
-	peer := fmt.Sprintf("[Peer]\nPublicKey = %s\nAllowedIPs = 10.173.91.0/24\n"+
+	iface := fmt.Sprintf("[Interface]\nPrivateKey = %s\nAddress = 10.9.0.200/32\n", testPrivKey)
+	peer := fmt.Sprintf("[Peer]\nPublicKey = %s\nAllowedIPs = 10.9.0.0/24\n"+
 		"Endpoint = wg.example.com:51820\n", testPubKey)
 
 	cases := map[string]string{
@@ -137,7 +137,7 @@ func TestParseWireGuardConfErrors(t *testing.T) {
 		"amnezia junk":     iface + "Jc = 4\n" + peer,
 		"unknown iface":    iface + "Frobnicate = 1\n" + peer,
 		"unknown peer key": iface + peer + "Frobnicate = 1\n",
-		"missing privkey":  "[Interface]\nAddress = 10.173.91.200/32\n" + peer,
+		"missing privkey":  "[Interface]\nAddress = 10.9.0.200/32\n" + peer,
 		"missing peer":     iface,
 		"missing pubkey":   iface + "[Peer]\nEndpoint = wg.example.com:51820\n",
 		"missing endpoint": iface + fmt.Sprintf("[Peer]\nPublicKey = %s\n", testPubKey),
@@ -162,25 +162,25 @@ func clashWireGuardYAML() string {
 proxies:
   - name: "nolan-lab-wg"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.173.91.13
+    ip: 10.9.0.13
     private-key: %s
     public-key: %s
-    allowed-ips: ['10.173.91.0/24', 'fd00::/64']
-    dns: [10.173.91.1]
+    allowed-ips: ['10.9.0.0/24', 'fd00::/64']
+    dns: [10.9.0.1]
     mtu: 1280
     udp: true
   - name: "gz-relay-wg"
     type: wireguard
     server: gz.example.com
     port: 51821
-    ip: 10.20.1.13/24
+    ip: 10.20.30.13/24
     private-key: %s
     public-key: %s
     pre-shared-key: %s
     allowed-ips:
-      - 10.20.1.0/24
+      - 10.20.30.0/24
     mtu: 1420
   - name: "old-socks"
     type: tuic
@@ -208,20 +208,20 @@ func TestParseClashWireGuard(t *testing.T) {
 	first := nodes[0]
 	eq(t, "type", first.Type, "wireguard")
 	eq(t, "tag", first.Tag, "nolan-lab-wg")
-	eq(t, "server", first.Server, "115.191.57.106")
+	eq(t, "server", first.Server, "198.51.100.10")
 	eqInt(t, "port", first.Port, 51820)
 	eq(t, "private_key", first.PrivateKey, testPrivKey)
 	eq(t, "public_key", first.PeerPublicKey, testPubKey)
 	eq(t, "preshared_key", first.PresharedKey, "")
 	// A bare `ip:` is a host address: /32 for v4.
-	eq(t, "addresses", strings.Join(first.Addresses, ","), "10.173.91.13/32")
-	eq(t, "allowed_ips", strings.Join(first.AllowedIPs, ","), "10.173.91.0/24,fd00::/64")
-	eq(t, "dns", strings.Join(first.DNS, ","), "10.173.91.1")
+	eq(t, "addresses", strings.Join(first.Addresses, ","), "10.9.0.13/32")
+	eq(t, "allowed_ips", strings.Join(first.AllowedIPs, ","), "10.9.0.0/24,fd00::/64")
+	eq(t, "dns", strings.Join(first.DNS, ","), "10.9.0.1")
 	eq(t, "mtu", strconv.Itoa(first.MTU), "1280")
 
 	second := nodes[1]
-	eq(t, "addresses", strings.Join(second.Addresses, ","), "10.20.1.13/24")
-	eq(t, "allowed_ips", strings.Join(second.AllowedIPs, ","), "10.20.1.0/24")
+	eq(t, "addresses", strings.Join(second.Addresses, ","), "10.20.30.13/24")
+	eq(t, "allowed_ips", strings.Join(second.AllowedIPs, ","), "10.20.30.0/24")
 	eq(t, "preshared_key", second.PresharedKey, testPSK)
 	eq(t, "source", second.Source, "sub")
 
@@ -237,12 +237,12 @@ func TestParseClashWireGuardRejectsChainedDialer(t *testing.T) {
 proxies:
   - name: "chained"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.173.91.13
+    ip: 10.9.0.13
     private-key: %s
     public-key: %s
-    allowed-ips: 10.173.91.0/24
+    allowed-ips: 10.9.0.0/24
     dialer-proxy: "gz-relay-wg"
 `, testPrivKey, testPubKey)
 	nodes, errs := ParseClashYAML([]byte(doc), "sub")
@@ -262,20 +262,20 @@ func TestParseClashWireGuardIncomplete(t *testing.T) {
 proxies:
   - name: "broken"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
     private-key: ` + testPrivKey + `
     public-key: ` + testPubKey + `
-    allowed-ips: ['10.173.91.0/24']
+    allowed-ips: ['10.9.0.0/24']
 `,
 		"no keys": `
 proxies:
   - name: "broken"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.173.91.13
-    allowed-ips: ['10.173.91.0/24']
+    ip: 10.9.0.13
+    allowed-ips: ['10.9.0.0/24']
 `,
 	}
 	for name, doc := range cases {
@@ -332,9 +332,9 @@ func TestParseTextImportsWireGuardConf(t *testing.T) {
 	eq(t, "private_key", n.PrivateKey, testPrivKey)
 	eq(t, "public_key", n.PeerPublicKey, testPubKey)
 	eq(t, "preshared_key", n.PresharedKey, testPSK)
-	eq(t, "addresses", strings.Join(n.Addresses, ","), "10.173.91.200/32,fd00::2/128")
-	eq(t, "allowed_ips", strings.Join(n.AllowedIPs, ","), "10.173.91.0/24,fd00::/64")
-	eq(t, "dns", strings.Join(n.DNS, ","), "10.173.91.1")
+	eq(t, "addresses", strings.Join(n.Addresses, ","), "10.9.0.200/32,fd00::2/128")
+	eq(t, "allowed_ips", strings.Join(n.AllowedIPs, ","), "10.9.0.0/24,fd00::/64")
+	eq(t, "dns", strings.Join(n.DNS, ","), "10.9.0.1")
 	eqInt(t, "keepalive", n.KeepAlive, 25)
 	// A pasted node has no file name, so the endpoint is what the list shows.
 	eq(t, "tag", n.Tag, "wg.homelab.example")
@@ -400,15 +400,15 @@ func TestParseTextImportDetection(t *testing.T) {
 func TestParseWireGuardConfRepeatedListsAccumulate(t *testing.T) {
 	conf := fmt.Sprintf(`[Interface]
 PrivateKey = %s
-Address = 10.173.91.200/32
+Address = 10.9.0.200/32
 Address = fd00::2/128
-DNS = 10.173.91.1
-DNS = 10.173.91.2
+DNS = 10.9.0.1
+DNS = 10.9.0.2
 MTU = 1420
 
 [Peer]
 PublicKey = %s
-AllowedIPs = 10.173.91.0/24
+AllowedIPs = 10.9.0.0/24
 AllowedIPs = fd00::/64
 Endpoint = wg.homelab.example:51820
 `, testPrivKey, testPubKey)
@@ -417,9 +417,9 @@ Endpoint = wg.homelab.example:51820
 	if err != nil {
 		t.Fatalf("ParseWireGuardConf: %v", err)
 	}
-	eq(t, "addresses", strings.Join(n.Addresses, ","), "10.173.91.200/32,fd00::2/128")
-	eq(t, "dns", strings.Join(n.DNS, ","), "10.173.91.1,10.173.91.2")
-	eq(t, "allowed_ips", strings.Join(n.AllowedIPs, ","), "10.173.91.0/24,fd00::/64")
+	eq(t, "addresses", strings.Join(n.Addresses, ","), "10.9.0.200/32,fd00::2/128")
+	eq(t, "dns", strings.Join(n.DNS, ","), "10.9.0.1,10.9.0.2")
+	eq(t, "allowed_ips", strings.Join(n.AllowedIPs, ","), "10.9.0.0/24,fd00::/64")
 
 	// The round trip must not drop the IPv4 half of either list.
 	out, err := WireGuardConf(n)
@@ -442,14 +442,14 @@ func TestWireGuardConfRejectsInjection(t *testing.T) {
 	base := config.Node{
 		Tag: "wg", Type: "wireguard", Server: "wg.homelab.example", Port: 51820,
 		PrivateKey: testPrivKey, PeerPublicKey: testPubKey,
-		Addresses:  []string{"10.173.91.200/32"},
-		AllowedIPs: []string{"10.173.91.0/24"},
+		Addresses:  []string{"10.9.0.200/32"},
+		AllowedIPs: []string{"10.9.0.0/24"},
 	}
 	const injected = "\nPostUp = touch /tmp/wg-export-pwned"
 	cases := map[string]func(*config.Node){
-		"dns newline":      func(n *config.Node) { n.DNS = []string{"10.173.91.1" + injected} },
-		"address newline":  func(n *config.Node) { n.Addresses = []string{"10.173.91.200/32" + injected} },
-		"allowed newline":  func(n *config.Node) { n.AllowedIPs = []string{"10.173.91.0/24\r" + injected} },
+		"dns newline":      func(n *config.Node) { n.DNS = []string{"10.9.0.1" + injected} },
+		"address newline":  func(n *config.Node) { n.Addresses = []string{"10.9.0.200/32" + injected} },
+		"allowed newline":  func(n *config.Node) { n.AllowedIPs = []string{"10.9.0.0/24\r" + injected} },
 		"preshared key":    func(n *config.Node) { n.PresharedKey = testPSK + injected },
 		"private key":      func(n *config.Node) { n.PrivateKey = testPrivKey + injected },
 		"peer public key":  func(n *config.Node) { n.PeerPublicKey = testPubKey + injected },

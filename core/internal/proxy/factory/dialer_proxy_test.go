@@ -242,7 +242,7 @@ func TestChainedNodeDialGoesThroughDialerProxy(t *testing.T) {
 	cfg := config.Config{
 		Nodes: []config.Node{{
 			Tag: "出口节点", Type: "vless",
-			Server: "154.50.110.12", Port: 3306, UUID: testUUID,
+			Server: "203.0.113.12", Port: 3306, UUID: testUUID,
 			DialerProxy: "mdev-hk",
 		}},
 		// A group target is resolved through the engine's map on every dial; the
@@ -269,8 +269,8 @@ func TestChainedNodeDialGoesThroughDialerProxy(t *testing.T) {
 	dialAndEcho(t, exit, "example.com:80", payload)
 
 	dials := upstream.recorded()
-	if len(dials) != 1 || dials[0] != "tcp 154.50.110.12:3306" {
-		t.Fatalf("chain dialed %v, want one dial of \"tcp 154.50.110.12:3306\"", dials)
+	if len(dials) != 1 || dials[0] != "tcp 203.0.113.12:3306" {
+		t.Fatalf("chain dialed %v, want one dial of \"tcp 203.0.113.12:3306\"", dials)
 	}
 	asked, _ := echo.served()
 	if len(asked) != 1 || asked[0] != "example.com:80" {
@@ -494,7 +494,7 @@ func TestChainedSSTransportUsesBaseDialer(t *testing.T) {
 	})
 	ob, err := buildOne(config.Node{
 		Tag: "出口节点", Type: "ss",
-		Server: "154.50.110.12", Port: 3306,
+		Server: "203.0.113.12", Port: 3306,
 		Method: "aes-256-gcm", Password: "secret",
 	}, base)
 	if err != nil {

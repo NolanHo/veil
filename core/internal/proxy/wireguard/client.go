@@ -862,7 +862,7 @@ func addrPortList(addrs []netip.AddrPort) string {
 // A WireGuard peer only carries the prefixes in its allowed_ips and the device
 // silently drops everything else, so a dial outside them would hang until its
 // deadline with no explanation. Checking here answers the question a homelab peer
-// always raises: with allowed_ips = ["10.173.91.0/24"] this outbound cannot be a
+// always raises: with allowed_ips = ["10.9.0.0/24"] this outbound cannot be a
 // global exit — public destinations fail here with this error, and the fix is to
 // widen allowed_ips to 0.0.0.0/0 (a peer that actually offers egress), not to
 // retry. An empty allowed_ips can carry nothing at all.

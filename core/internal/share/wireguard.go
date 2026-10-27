@@ -203,7 +203,7 @@ func WireGuardConf(n config.Node) (string, error) {
 	}
 	// Every value that reaches a "Key = value" line is checked first: one line
 	// break inside a value ends the directive and injects another one, so a node
-	// carrying "10.173.91.1\nPostUp = ..." must be refused, not written out as a
+	// carrying "10.9.0.1\nPostUp = ..." must be refused, not written out as a
 	// config that does something the user never asked for.
 	for _, f := range []struct {
 		field  string
@@ -266,7 +266,7 @@ func checkConfValue(field, value string) error {
 }
 
 // normalizeWGAddrs gives a bare address its full-length mask, which is how
-// mihomo's `ip:` field is meant (10.173.91.13 == 10.173.91.13/32). A value that
+// mihomo's `ip:` field is meant (10.9.0.13 == 10.9.0.13/32). A value that
 // still does not parse is passed through so the outbound reports it in its own
 // words.
 func normalizeWGAddrs(list []string) []string {

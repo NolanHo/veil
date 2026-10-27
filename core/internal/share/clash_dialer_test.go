@@ -22,7 +22,7 @@ proxies:
     tls: true
   - name: "出口节点"
     type: ss
-    server: 154.50.110.12
+    server: 203.0.113.12
     port: 3306
     cipher: aes-256-gcm
     password: "secret"
@@ -111,12 +111,12 @@ proxies:
     dialer-proxy: "mdev-hk"
   - name: "wg"
     type: wireguard
-    server: 115.191.57.106
+    server: 198.51.100.10
     port: 51820
-    ip: 10.173.91.13
+    ip: 10.9.0.13
     private-key: %[2]s
     public-key: %[3]s
-    allowed-ips: 10.173.91.0/24
+    allowed-ips: 10.9.0.0/24
     dialer-proxy: "mdev-hk"
 `, dialerTestUUID, testPrivKey, testPubKey)
 

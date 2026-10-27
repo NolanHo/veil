@@ -86,8 +86,8 @@ Add to `config.Node` (JSON snake_case, matching the file's style):
 | PrivateKey | `private_key` | base64 WireGuard private key |
 | PeerPublicKey | `public_key` | base64 peer public key |
 | PresharedKey | `preshared_key,omitempty` | base64 PSK |
-| Addresses | `addresses,omitempty` | interface addrs, e.g. `["10.173.91.200/32"]` |
-| AllowedIPs | `allowed_ips,omitempty` | peer allowed IPs, e.g. `["10.173.91.0/24"]` |
+| Addresses | `addresses,omitempty` | interface addrs, e.g. `["10.9.0.200/32"]` |
+| AllowedIPs | `allowed_ips,omitempty` | peer allowed IPs, e.g. `["10.9.0.0/24"]` |
 | MTU | `mtu,omitempty` | default 1420 |
 | KeepAlive | `keepalive,omitempty` | seconds, default 0 |
 | DNS | `dns,omitempty` | interface DNS for the userspace stack |
